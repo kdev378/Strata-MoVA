@@ -104,3 +104,23 @@ llama.cpp's values:
   from SiLU, where ggml's CPU uses its own vectorised exp (`ggml_v_expf`, AVX-512 here) and the reference uses `expf`.
   This is backend-specific: llama.cpp on CUDA computes these differently again.
 - Decoding one token at a time against the KV cache gives the same numbers as the batch, so positions above 0 work.
+
+### MoVA (layer 3, the first MoVA layer)
+
+The value router and the value experts as llama.cpp's `build_routed_value`: `attn_v_gate` logits (a Q4_K matmul, so
+the activations are rounded to Q8_K first), sigmoid, `attn_v_gate.bias` added for the choice only, the top 4 in ggml's
+own sort order, the 4 unbiased probabilities renormalised and times 2.5, each chosen expert's output (2560 -> 1024)
+through SiLU and times its weight, the 4 added in the router's order. The KV cache then holds this V like any other.
+
+ggml's CPU top-k is an unstable `std::sort` of the indices 0 .. n-1 with `v[a] > v[b]`; the reference does exactly the
+same (`argsort_desc`), so on equal values it picks what llama.cpp's CPU build picks. llama.cpp's CUDA argsort is a
+different algorithm, so on equal values the two llama.cpp builds themselves can pick differently.
+
+Measured as above (same prompt, same machine), against a 4-layer llama.cpp dump:
+
+| Run | `v_moe_logits-3` | Chosen value experts | `Vcur_routed-3` | `ffn_inp-3` | Non-finite |
+|---|---|---|---|---|---|
+| layer 3 from llama.cpp's input (`--isolate`) | 1.1e-7 | same 4, same order, 6 of 6 tokens (the whole 64-way order identical) | 1.8e-7 | 8.2e-8 | 0 |
+| layers 0-3 in one run | 4.3e-3 | same 4, same order, 6 of 6 tokens (ranks 5 and below differ) | 6.0e-3 | 1.6e-4 | 0 |
+
+(rms rel as above.) The MoE FFN of layer 3 comes next; the reference stops after `ffn_inp-3` until then.

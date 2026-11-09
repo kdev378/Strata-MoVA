@@ -106,6 +106,34 @@ int main() {
         check(round_trip, "fp32_to_fp16(fp16_to_fp32(h)) == h over the finite halves");
     }
     {
+        // the router: the bias chooses, the unbiased probabilities weigh; renormalised, then scaled
+        const float logits[4] = {2.0f, 0.0f, 1.0f, -1.0f};
+        const float bias[4] = {0.0f, 5.0f, 0.0f, 0.0f};   // expert 1 has the lowest probability but is chosen first
+        std::vector<std::string> seen;
+        const R::Routed r = R::route(logits, bias, 1, 4, 2, strata::k2h::Gating::Sigmoid, true, 2.5,
+                                     [&](const char* what, const std::vector<float>&) { seen.push_back(what); });
+        const float p1 = R::sigmoid(0.0f), p0 = R::sigmoid(2.0f);
+        check(r.ids.size() == 2 && r.ids[0] == 1 && r.ids[1] == 0, "the selection bias decides which experts are chosen");
+        check(near(r.weights[0], 2.5 * p1 / (p1 + p0), 1e-6) && near(r.weights[1], 2.5 * p0 / (p1 + p0), 1e-6),
+              "their weights are the unbiased probabilities, renormalised to 1 and times 2.5");
+        check(seen == std::vector<std::string>({"probs_biased", "argsort", "topk", "probs", "weights_norm", "weights"}),
+              "the router reports llama.cpp's intermediate tensors");
+        const R::Routed u = R::route(logits, nullptr, 1, 4, 2, strata::k2h::Gating::Sigmoid, false, 0.0,
+                                     [](const char*, const std::vector<float>&) {});
+        check(u.ids[0] == 0 && u.ids[1] == 2 && u.weights[0] == p0, "no bias, no norm, no scale: the top probabilities as they are");
+        const float tiny[2] = {1e-30f, 1e-30f};
+        const R::Routed c = R::route(tiny, nullptr, 1, 2, 2, strata::k2h::Gating::Softmax, true, 0.0,
+                                     [](const char*, const std::vector<float>&) {});
+        check(near(c.weights[0], 0.5, 1e-6), "softmax gating: two equal logits share the weight");
+        // equal values: the order is std::sort's on the identity with v[a] > v[b], as ggml's CPU argsort
+        std::vector<float> eq(64, 1.0f);
+        eq[10] = 2.0f;
+        std::vector<int32_t> ref((size_t) 64);
+        for (int i = 0; i < 64; ++i) ref[(size_t) i] = i;
+        std::sort(ref.begin(), ref.end(), [&](int32_t a, int32_t b) { return eq[(size_t) a] > eq[(size_t) b]; });
+        check(R::argsort_desc(eq.data(), 64) == ref && ref[0] == 10, "argsort_desc keeps ggml's CPU order on ties");
+    }
+    {
         // the matrix product over a GGUF weight: W [n_in 4, n_out 3] F32, two tokens
         const fs::path dir = fs::temp_directory_path() /
                              ("strata-k2h-cpu-ref-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));

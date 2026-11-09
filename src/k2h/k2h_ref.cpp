@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <string>
@@ -134,6 +135,8 @@ int main(int argc, char** argv) {
             pieces.push_back({0, split});
             for (int64_t t = split; t < T; ++t) pieces.push_back({t, 1});
         }
+        std::string stopped;
+        try {
         for (const auto& [p0, n] : pieces) {
             std::vector<int32_t> part(tokens.begin() + p0, tokens.begin() + p0 + n);
             std::vector<float> x((size_t) (n * g.n_embd));
@@ -149,6 +152,10 @@ int main(int argc, char** argv) {
                 }
                 fwd.run_layer(l, x, n, p0, hook);
             }
+        }
+        } catch (const std::exception& e) {
+            stopped = e.what();   // compare what was computed before the stop, then fail
+            std::printf("  the forward stopped: %s\n", stopped.c_str());
         }
         for (const std::string& name : order) {
             const std::vector<float>& v = got[name];
@@ -183,8 +190,22 @@ int main(int argc, char** argv) {
             }
             const double rel = max_ref > 0 ? max_diff / max_ref : max_diff;
             const double rms_rel = ssr > 0 ? std::sqrt(ssd / ssr) : std::sqrt(ssd);
-            std::printf("  %-14s %10lld %12.5g %12.5g %10.3g %10.3g %6zu\n", name.c_str(), (long long) n, max_ref, max_diff, rel,
-                        rms_rel, nonfinite);
+            std::string sets;
+            if (name.find("_topk-") != std::string::npos) {   // the routers' choices: tokens whose chosen set differs
+                const int64_t T = (int64_t) tokens.size(), k = n / T;
+                int64_t differ = 0, order = 0;
+                for (int64_t t = 0; t < T; ++t) {
+                    std::vector<float> a(d + t * k, d + (t + 1) * k), b(r.data.begin() + t * k, r.data.begin() + (t + 1) * k);
+                    order += a != b ? 1 : 0;
+                    std::sort(a.begin(), a.end());
+                    std::sort(b.begin(), b.end());
+                    differ += a != b ? 1 : 0;
+                }
+                sets = "   chosen set differs on " + std::to_string(differ) + " of " + std::to_string(T) + " tokens, order on " +
+                       std::to_string(order);
+            }
+            std::printf("  %-14s %10lld %12.5g %12.5g %10.3g %10.3g %6zu%s\n", name.c_str(), (long long) n, max_ref, max_diff, rel,
+                        rms_rel, nonfinite, sets.c_str());
             ++compared;
             if (rel > worst_rel) {
                 worst_rel = rel;
@@ -194,7 +215,7 @@ int main(int argc, char** argv) {
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("k2h-ref: %zu tensors compared with llama.cpp (of %zu it holds), %zu non-finite values; worst rel %.3g (%s); %.1f s\n",
                     compared, ref.size(), nonfinite_total, worst_rel, worst.empty() ? "-" : worst.c_str(), secs);
-        if (nonfinite_total) return 1;
+        if (nonfinite_total || !stopped.empty()) return 1;
         if (!ref.empty() && compared != ref.size()) return 1;
         return 0;
     } catch (const std::exception& e) {

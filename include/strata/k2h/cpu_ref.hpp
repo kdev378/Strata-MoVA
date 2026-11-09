@@ -22,8 +22,13 @@
 // With the rounding off, the layer outputs differ from llama.cpp by several percent after two layers (measured on
 // K2-Horizon-MoVA-36B-A4B Q4_K_M, docs/K2_HORIZON.md), so the comparison needs it on.
 //
-// Steps done: the dense layers (0 .. leading_dense_block_count - 1) and the attention of every layer except MoVA.  A MoE
-// or MoVA layer is refused (steps 5 and 6 of the port).
+// Steps done: the dense layers (0 .. leading_dense_block_count - 1) and the attention of every layer, MoVA included
+// (step 5).  A MoE FFN is refused after the attention (step 6 of the port).
+//
+// MoVA and the routers: the value router's logits (attn_v_gate, a matmul like any other), sigmoid, the selection bias
+// added for the choice only, the top k in ggml's own sort order (argsort_desc), the chosen experts' unbiased
+// probabilities renormalised and scaled (route), each chosen value expert's output through SiLU times its weight, and
+// the k weighted outputs added in the router's order.
 #pragma once
 
 #include "strata/k2h/dequant_rows.hpp"
@@ -120,9 +125,11 @@ inline void round_for(uint32_t type, float* x, int64_t n) {
     }
 }
 
-/// y[t * n_out + j] = sum_i W[j][i] x[t * n_in + i] for T tokens; W is a GGUF matrix [n_in, n_out] (row j contiguous).
-inline void matmul(const TensorRef& W, const float* x_in, int64_t T, float* y, int threads, ActRound act = ActRound::LlamaCpu) {
-    const int64_t n_in = (int64_t) W.info->shape[0], n_out = (int64_t) W.info->shape[1];
+/// y[t * n_out + j] = sum_i W[row0 + j][i] x[t * n_in + i] for T tokens and j < n_out: the rows row0 .. row0 + n_out - 1 of a
+/// GGUF tensor whose dim 0 is n_in (a 2-D matrix [n_in, rows], or one expert's [n_in, rows_per_expert] of a 3-D one).
+inline void matmul_rows(const TensorRef& W, int64_t row0, int64_t n_out, const float* x_in, int64_t T, float* y, int threads,
+                        ActRound act = ActRound::LlamaCpu) {
+    const int64_t n_in = (int64_t) W.info->shape[0];
     std::vector<float> rounded;
     const float* x = x_in;
     if (act == ActRound::LlamaCpu) {
@@ -136,7 +143,7 @@ inline void matmul(const TensorRef& W, const float* x_in, int64_t T, float* y, i
     auto work = [&](int64_t j0, int64_t j1) {
         std::vector<float> row((size_t) n_in);
         for (int64_t j = j0; j < j1; ++j) {
-            if (!dequantize_rows(W.type(), W.data() + j * row_bytes, row.data(), n_in))
+            if (!dequantize_rows(W.type(), W.data() + (row0 + j) * row_bytes, row.data(), n_in))
                 throw std::runtime_error(W.name() + ": no dequantizer for " + W.info->type_name());
             for (int64_t t = 0; t < T; ++t) {
                 const float* xt = x + t * n_in;
@@ -155,6 +162,82 @@ inline void matmul(const TensorRef& W, const float* x_in, int64_t T, float* y, i
     const int64_t per = (n_out + n_thr - 1) / n_thr;
     for (int64_t k = 0; k < n_thr; ++k) pool.emplace_back(work, k * per, std::min(n_out, (k + 1) * per));
     for (auto& th : pool) th.join();
+}
+
+/// y[t * n_out + j] = sum_i W[j][i] x[t * n_in + i] for T tokens; W is a GGUF matrix [n_in, n_out] (row j contiguous).
+inline void matmul(const TensorRef& W, const float* x, int64_t T, float* y, int threads, ActRound act = ActRound::LlamaCpu) {
+    matmul_rows(W, 0, (int64_t) W.info->shape[1], x, T, y, threads, act);
+}
+
+/// The indices of v[0 .. n) in descending order, exactly as ggml's CPU argsort orders them (ops.cpp
+/// ggml_compute_forward_argsort_f32: the identity, then an UNSTABLE std::sort with `v[a] > v[b]`), so that equal values keep
+/// llama.cpp's CPU order.  (Its CUDA argsort is another algorithm: on equal values the two llama.cpp builds can differ.)
+inline std::vector<int32_t> argsort_desc(const float* v, int64_t n) {
+    std::vector<int32_t> idx((size_t) n);
+    for (int64_t j = 0; j < n; ++j) idx[(size_t) j] = (int32_t) j;
+    std::sort(idx.begin(), idx.end(), [v](int32_t a, int32_t b) { return v[a] > v[b]; });
+    return idx;
+}
+
+inline float sigmoid(float x) { return 1.f / (1.f + expf(-x)); }   // op_sigmoid
+
+/// One router (llama.cpp build_moe_ffn / build_routed_value): gating of the logits, the selection bias added for the choice
+/// only, the top k in ggml's order, the chosen experts' unbiased probabilities, renormalised (sum clamped at 2^-14) and
+/// scaled.  ids / weights are [T][k].  The intermediate tensors go to `emit` under `prefix` + llama.cpp's suffixes.
+struct Routed {
+    std::vector<int32_t> ids;
+    std::vector<float> weights;
+};
+inline Routed route(const float* logits, const float* bias, int64_t T, int64_t n, int64_t k, Gating gating, bool norm,
+                    double scale, const std::function<void(const char*, const std::vector<float>&)>& emit) {
+    std::vector<float> probs((size_t) (T * n));
+    for (int64_t t = 0; t < T; ++t) {
+        const float* lg = logits + t * n;
+        float* pr = &probs[(size_t) (t * n)];
+        if (gating == Gating::Sigmoid) {
+            for (int64_t j = 0; j < n; ++j) pr[j] = sigmoid(lg[j]);
+        } else {   // softmax (ggml_soft_max: max subtracted, the sum in double)
+            float mx = -INFINITY;
+            for (int64_t j = 0; j < n; ++j) mx = std::max(mx, lg[j]);
+            double sum = 0;
+            for (int64_t j = 0; j < n; ++j) sum += (pr[j] = expf(lg[j] - mx));
+            for (int64_t j = 0; j < n; ++j) pr[j] = (float) (pr[j] * (1.0 / sum));
+        }
+    }
+    std::vector<float> sel = probs;
+    if (bias)
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t j = 0; j < n; ++j) sel[(size_t) (t * n + j)] += bias[j];
+    if (bias) emit("probs_biased", sel);
+    Routed r;
+    r.ids.resize((size_t) (T * k));
+    r.weights.resize((size_t) (T * k));
+    std::vector<float> order((size_t) (T * n)), top((size_t) (T * k));
+    for (int64_t t = 0; t < T; ++t) {
+        const std::vector<int32_t> idx = argsort_desc(&sel[(size_t) (t * n)], n);
+        for (int64_t j = 0; j < n; ++j) order[(size_t) (t * n + j)] = (float) idx[(size_t) j];
+        for (int64_t j = 0; j < k; ++j) {
+            r.ids[(size_t) (t * k + j)] = idx[(size_t) j];
+            top[(size_t) (t * k + j)] = (float) idx[(size_t) j];
+            r.weights[(size_t) (t * k + j)] = probs[(size_t) (t * n + idx[(size_t) j])];
+        }
+    }
+    emit("argsort", order);
+    emit("topk", top);
+    emit("probs", probs);
+    if (norm) {
+        for (int64_t t = 0; t < T; ++t) {
+            double sum = 0;   // ggml_vec_sum_f32: a double sum, stored as float
+            for (int64_t j = 0; j < k; ++j) sum += r.weights[(size_t) (t * k + j)];
+            const float s = std::max((float) sum, 6.103515625e-5f);
+            for (int64_t j = 0; j < k; ++j) r.weights[(size_t) (t * k + j)] /= s;
+        }
+        emit("weights_norm", r.weights);
+    }
+    if (scale != 0.0 && scale != 1.0)
+        for (float& w : r.weights) w *= (float) scale;
+    emit("weights", r.weights);
+    return r;
 }
 
 /// A 1-D weight (norms, biases) as F32.
@@ -237,11 +320,7 @@ public:
     }
 
     /// One layer over the residual stream `x` ([T][n_embd], updated in place) of T tokens at positions pos0 ..
-    void run_layer(int64_t l, std::vector<float>& x, int64_t T, int64_t pos0, const Hook& hook = {}) {
-        if (g_.is_moe_layer(l) || g_.is_mova_layer(l))
-            throw std::runtime_error("layer " + std::to_string(l) + " is a MoE/MoVA layer: not in the CPU reference yet");
-        layer(l, x, T, pos0, hook);
-    }
+    void run_layer(int64_t l, std::vector<float>& x, int64_t T, int64_t pos0, const Hook& hook = {}) { layer(l, x, T, pos0, hook); }
 
     void embed(const std::vector<int32_t>& tokens, float* x) const {
         const TensorRef& E = w_.token_embd;
@@ -259,6 +338,36 @@ private:
         if (hook) hook(std::string(what) + "-" + std::to_string(l), v.data(), T, (int64_t) v.size() / T);
     }
 
+    /// MoVA (llama.cpp build_routed_value): per token, the value router picks n_value_expert_used of the value experts,
+    /// V = sum_k w_k * silu(W_k x) in the order the router lists them (ggml's chain of adds), into `v` [T][n_embd_kv].
+    void mova(int64_t l, const LayerWeights& L, const std::vector<float>& h, int64_t T, std::vector<float>& v, const Hook& hook) {
+        const int64_t N = g_.n_embd, NV = g_.n_value_expert, K = g_.n_value_expert_used, KV = g_.n_embd_kv();
+        std::vector<float> logits((size_t) (T * NV));
+        matmul(L.attn_v_gate, h.data(), T, logits.data(), threads_, act_);
+        emit(hook, "v_moe_logits", l, logits, T);
+        const std::vector<float> bias = L.attn_v_gate_b ? vector_of(L.attn_v_gate_b) : std::vector<float>();
+        const Routed r = route(logits.data(), bias.empty() ? nullptr : bias.data(), T, NV, K, g_.gating, g_.expert_weights_norm,
+                               g_.expert_weights_scale, [&](const char* what, const std::vector<float>& d) {
+                                   emit(hook, (std::string("v_moe_") + what).c_str(), l, d, T);
+                               });
+        std::vector<float> weighted((size_t) (T * K * KV));
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t k = 0; k < K; ++k) {
+                float* o = &weighted[(size_t) ((t * K + k) * KV)];
+                matmul_rows(L.attn_v_exps, (int64_t) r.ids[(size_t) (t * K + k)] * KV, KV, &h[(size_t) (t * N)], 1, o, threads_, act_);
+                const float w = r.weights[(size_t) (t * K + k)];
+                for (int64_t i = 0; i < KV; ++i) o[i] = silu(o[i]) * w;
+            }
+        emit(hook, "v_moe_weighted", l, weighted, T);
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t i = 0; i < KV; ++i) {
+                float acc = weighted[(size_t) (t * K * KV + i)];
+                for (int64_t k = 1; k < K; ++k) acc += weighted[(size_t) ((t * K + k) * KV + i)];
+                v[(size_t) (t * KV + i)] = acc;
+            }
+        emit(hook, "Vcur_routed", l, v, T);
+    }
+
     void layer(int64_t l, std::vector<float>& x, int64_t T, int64_t pos0, const Hook& hook) {
         const LayerWeights& L = w_.layers[(size_t) l];
         const int64_t N = g_.n_embd, HD = g_.head_dim, H = g_.n_head, HKV = g_.n_head_kv, KV = g_.n_embd_kv(), HQ = H * HD;
@@ -272,7 +381,8 @@ private:
         std::vector<float> q((size_t) (T * HQ)), k((size_t) (T * KV)), v((size_t) (T * KV));
         matmul(L.attn_q, h.data(), T, q.data(), threads_, act_);
         matmul(L.attn_k, h.data(), T, k.data(), threads_, act_);
-        matmul(L.attn_v, h.data(), T, v.data(), threads_, act_);
+        if (L.attn_v_exps) mova(l, L, h, T, v, hook);
+        else matmul(L.attn_v, h.data(), T, v.data(), threads_, act_);
         if (L.attn_q_norm || L.attn_k_norm) throw std::runtime_error("per-head Q/K norms are not in the CPU reference yet");
         for (int64_t t = 0; t < T; ++t) {
             rope_neox(&q[(size_t) (t * HQ)], H, HD, g_.n_rot, pos0 + t, (float) g_.rope_freq_base);
@@ -327,6 +437,9 @@ private:
         matmul(L.attn_output, att.data(), T, o.data(), threads_, act_);
         for (size_t i = 0; i < x.size(); ++i) x[i] += o[i];
         emit(hook, "ffn_inp", l, x, T);
+
+        if (g_.is_moe_layer(l))
+            throw std::runtime_error("layer " + std::to_string(l) + ": the MoE FFN is not in the CPU reference yet");
 
         // dense FFN
         const std::vector<float> fn = vector_of(L.ffn_norm);
