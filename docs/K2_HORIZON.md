@@ -70,3 +70,37 @@ read: 798 tensors, 37.445 G weights, 20.821 GiB, 0 non-finite values, 61.5 s
 ```
 
 The 96 absent optional entries are `attn_q_norm` and `attn_k_norm` on all 48 layers.
+
+## The CPU reference forward, against llama.cpp
+
+`include/strata/k2h/cpu_ref.hpp` is a plain F32 forward over the dequantized weights, in llama.cpp's order, for checking
+numbers (no speed). So far it runs the dense layers 0-2 and their attention; the MoE and MoVA layers come next.
+
+The reference side is `tools/k2h/llama_dump.cpp`, a small program linked against llama.cpp b11454 (build line in the
+file). It writes llama.cpp's own intermediate tensors (`attn_norm`, `Qcur`, `Kcur`, `Vcur`, `kqv_out`, `ffn_inp`,
+`ffn_norm`, `ffn_out`, `l_out` per layer) for a prompt, with an F32 KV cache, flash attention off and the CPU weight
+repack off (the weights stay in the file's mmap). `strata-k2h-ref MODEL --ref DIR` runs the same token ids and compares
+every tensor.
+
+llama.cpp's CPU matmul rounds the activations to Q8_K before multiplying by a Q4_K or Q6_K weight. The reference does
+the same rounding (`ActRound::LlamaCpu`, the default). Without it the two drift apart by several percent within two
+layers; with it they agree to float rounding.
+
+Measured 2026-11-09 on the reference file, prompt "The capital of France is" (tokens 0, 864, 7169, 331, 8465, 395),
+llama.cpp b11454 CPU build on a 4-core AVX-512 cloud VM. "rms rel" is the RMS of the difference over the RMS of
+llama.cpp's values:
+
+| Run | Layer 0 `l_out` | Layer 1 `l_out` | Layer 2 `l_out` | Worst tensor (max diff / max value) | Non-finite |
+|---|---|---|---|---|---|
+| layers 0-2 in one run | 4.0e-6 | 7.2e-5 | 1.5e-4 | 4.6e-3 (`Vcur-2`) | 0 |
+| each layer from llama.cpp's input (`--isolate`) | 4.0e-6 | 6.4e-6 | 4.5e-5 | 3.1e-5 (`ffn_out-2`) | 0 |
+| 2 tokens, then one at a time against the KV cache (`--split 2`) | same as the first row, to the digit | | | | 0 |
+
+- Layer by layer the arithmetic matches llama.cpp to float rounding (`--isolate`): the grouped norm, Q/K/V, NEOX RoPE,
+  GQA attention, the base-2 softplus gate, `attn_output` and the dense FFN.
+- Across layers the difference grows: `l_out` from 4.0e-6 after layer 0 to 1.5e-4 after layer 2. The likely cause, not
+  proven: a value that sits on a
+  Q8_K rounding boundary rounds to the next integer on one side and not the other, and the first small differences come
+  from SiLU, where ggml's CPU uses its own vectorised exp (`ggml_v_expf`, AVX-512 here) and the reference uses `expf`.
+  This is backend-specific: llama.cpp on CUDA computes these differently again.
+- Decoding one token at a time against the KV cache gives the same numbers as the batch, so positions above 0 work.
