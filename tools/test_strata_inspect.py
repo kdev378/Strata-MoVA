@@ -50,6 +50,26 @@ class Verdict(unittest.TestCase):
         self.assertIn("Qwen3.6-35B-A3B", sentence)
         self.assertIn("--family qwen36", sentence)
 
+    def test_k2_horizon_is_recognised_not_run(self):
+        fp = self.fp("qwen/Q2_0")
+        fp["arch"] = "k2-horizon"
+        kind, sentence = SI.verdict(fp, self.table)
+        self.assertEqual(kind, "recognised")
+        self.assertIn("K2 Horizon", sentence)
+        self.assertIn("no build runs it yet", sentence)
+
+    def test_mova_value_experts_are_not_routed_experts(self):
+        self.assertEqual(SI.qs.category("blk.3.attn_v_exps.weight"), "value experts (MoVA)")
+        self.assertEqual(SI.qs.category("blk.3.attn_v_gate.weight"), "value experts (MoVA)")
+        self.assertEqual(SI.qs.category("blk.3.attn_v_gate.bias"), "value experts (MoVA)")
+        self.assertEqual(SI.qs.category("model.layers.3.self_attn.v_experts.7.weight"), "value experts (MoVA)")
+        self.assertEqual(SI.qs.category("blk.3.ffn_up_exps.weight"), "routed experts")
+        self.assertEqual(SI.qs.category("blk.0.attn_v.weight"), "attention (incl. GDN qkv/gate)")
+        fp = SI.fingerprint("k2-horizon", [
+            {"name": "blk.3.attn_v_exps.weight", "type": "Q4_K", "elements": 256, "bytes": 144},
+            {"name": "blk.3.ffn_up_exps.weight", "type": "Q4_K", "elements": 512, "bytes": 288}])
+        self.assertEqual(fp["expert_bytes"], {"Q4_K": 288})   # the FFN's experts only
+
     def test_expert_type_without_kernel(self):
         fp = self.fp("qwen/IQ3_S")
         fp["expert_bytes"] = {"IQ1_S": 30_000_000_000}

@@ -30,6 +30,7 @@ import quantscope as qs  # noqa: E402
 FINGERPRINTS = ROOT / "data" / "gguf_fingerprints.json"
 ARCH = "qwen4exp"                                       # Qwen3.8-Flash-Next's general.architecture
 PREVIEW_ARCHS = {"qwen35moe": "Qwen3.6-35B-A3B"}         # model families Strata knows but does not run yet (T0)
+RECOGNISED_ARCHS = {"k2-horizon": "K2 Horizon"}          # read by the engine's guard (include/strata/k2h), run by no build
 
 # the files setup installs: (family, model, ModelScope repository, file name prefix) - for --fingerprints
 KNOWN = [
@@ -95,13 +96,18 @@ def load_fingerprints(path: Path = FINGERPRINTS) -> dict:
 def verdict(fp: dict, table: dict) -> tuple[str, str]:
     """(kind, sentence): kind is "known" (a file setup installs, under any name), "family" (another family Strata
     runs on its own engine path: Qwen3.6), "layout" (the same routed-expert
-    layout as one: a fine-tune made with the same recipe, untested), "no" (Strata cannot run it) or "untested"
+    layout as one: a fine-tune made with the same recipe, untested), "recognised" (a family Strata reads but no build
+    runs yet: K2 Horizon), "no" (Strata cannot run it) or "untested"
     (naming the tensors whose quantization no file Strata runs has for them)."""
     known = {k: v for k, v in table.items() if not k.startswith("_")}
     if fp["arch"] in PREVIEW_ARCHS:
         return "family", (f"{PREVIEW_ARCHS[fp['arch']]} (architecture {fp['arch']!r}): Strata runs it on its own "
                           "engine path in the NVIDIA (CUDA) and AMD (HIP) builds, not yet on Intel Arc (SYCL); setup "
                           "installs it with --family qwen36")
+    if fp["arch"] in RECOGNISED_ARCHS:
+        return "recognised", (f"{RECOGNISED_ARCHS[fp['arch']]} (architecture {fp['arch']!r}): Strata recognises the "
+                              "file, but no build runs it yet (its engine path is in development); setup does not "
+                              "install it")
     if fp["arch"] != ARCH:
         return "no", f"not Qwen3.8-Flash-Next (architecture {fp['arch']!r}): Strata runs only that model"
     exact = [k for k, v in known.items() if v["expert_bytes"] == fp["expert_bytes"] and v["bytes"] == fp["bytes"]
@@ -179,7 +185,7 @@ def main() -> None:
     fp = fingerprint(arch, tensors)
     kind, sentence = verdict(fp, load_fingerprints())
     print(f"\nStrata: {sentence}")
-    sys.exit(0 if kind in ("known", "layout") else 2 if kind == "no" else 0)
+    sys.exit(0 if kind in ("known", "layout") else 2 if kind in ("no", "recognised") else 0)
 
 
 if __name__ == "__main__":

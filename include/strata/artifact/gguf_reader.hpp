@@ -664,6 +664,23 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// K2 Horizon's guard (architecture "k2-horizon", llama.cpp b11454 src/models/k2-horizon.cpp): the keys llama.cpp's
+/// loader requires, present and numeric.  Every other key is optional there and keeps llama.cpp's default; the values
+/// and their consistency are judged by strata::k2h::geometry_from_gguf (include/strata/k2h/geometry.hpp).
+inline std::string check_architecture_k2horizon(const GgufFile& g) {
+    static const char* const keys[] = {
+        "k2-horizon.block_count", "k2-horizon.embedding_length", "k2-horizon.feed_forward_length",
+        "k2-horizon.attention.head_count", "k2-horizon.attention.head_count_kv",
+        "k2-horizon.attention.layer_norm_rms_epsilon", "k2-horizon.rope.freq_base",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +868,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::K2Horizon) return check_architecture_k2horizon(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

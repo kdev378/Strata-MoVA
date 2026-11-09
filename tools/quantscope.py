@@ -273,6 +273,9 @@ def read_ninfer(src: Source) -> list[dict]:
 CATEGORIES = [
     ("norms", r"(norm)"),
     ("hyper-connections", r"(hc_|_hc\.|hyper_connection)"),
+    # K2 Horizon's MoVA: value experts in the attention (GGUF attn_v_exps / attn_v_gate, HF self_attn.v_experts.N /
+    # v_gate), ahead of "routed experts" so that the FFN experts' figures stay the FFN's
+    ("value experts (MoVA)", r"(attn_v_exps|attn_v_gate|\.v_experts\.|self_attn\.v_gate)"),
     ("routed experts", r"(_exps\b|\.experts\.|experts\.\d+|block_sparse_moe\.experts)"),
     ("shared experts", r"(_shexp|shared_expert|moe\.shared\.)"),
     ("router", r"(ffn_gate_inp|\.gate\.weight$|\.router\b|shared_score)"),
