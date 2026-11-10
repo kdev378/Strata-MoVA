@@ -8,6 +8,10 @@
 //       -L$LLAMA/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$LLAMA/build/bin -o llama-k2h-dump
 //
 //   llama-k2h-dump MODEL.gguf OUT_DIR (--prompt TEXT | --tokens 1,2,3) [--layers N] [--threads N] [--ctx N] [--logits]
+//   llama-k2h-dump MODEL.gguf OUT_DIR (--prompt TEXT | --tokens IDS) --generate N [--default-cache]
+//       greedy: N tokens after the prompt (argmax, the lowest id on equal logits), to OUT_DIR/generated.txt and stdout;
+//       no tensors are written.  --default-cache keeps llama.cpp's own context defaults (F16 KV cache, flash attention
+//       auto) instead of the F32 cache with flash attention off.
 //
 // Writes OUT_DIR/tokens.txt (the token ids), OUT_DIR/index.txt (one line per tensor: name type ne0 ne1 ne2 ne3) and
 // OUT_DIR/<name>.f32 (the tensor as F32, ne0 fastest, contiguous).  The tensors are the graph's names (src/models/
@@ -111,7 +115,8 @@ int main(int argc, char** argv) {
     d.dir = argv[2];
     std::string prompt;
     std::vector<llama_token> tokens;
-    int threads = 4, n_ctx = 2048;
+    int threads = 4, n_ctx = 2048, generate = 0;
+    bool default_cache = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
@@ -120,6 +125,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--ctx" && i + 1 < argc) n_ctx = std::atoi(argv[++i]);
         else if (a == "--logits") d.logits = true;
+        else if (a == "--generate" && i + 1 < argc) generate = std::atoi(argv[++i]);
+        else if (a == "--default-cache") default_cache = true;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     llama_backend_init();
@@ -140,17 +147,50 @@ int main(int argc, char** argv) {
     cp.n_ctx = (uint32_t) n_ctx;
     cp.n_batch = cp.n_ubatch = (uint32_t) std::max<size_t>(tokens.size(), 1);
     cp.n_threads = cp.n_threads_batch = threads;
-    cp.type_k = GGML_TYPE_F32;
-    cp.type_v = GGML_TYPE_F32;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cp.cb_eval = on_tensor;
-    cp.cb_eval_user_data = &d;
+    if (!default_cache) {
+        cp.type_k = GGML_TYPE_F32;
+        cp.type_v = GGML_TYPE_F32;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+    if (generate <= 0) {
+        cp.cb_eval = on_tensor;
+        cp.cb_eval_user_data = &d;
+    }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { std::fprintf(stderr, "cannot make a context\n"); return 1; }
     {
         std::ofstream tf(d.dir + "/tokens.txt");
         for (size_t i = 0; i < tokens.size(); ++i) tf << (i ? "," : "") << tokens[i];
         tf << '\n';
+    }
+    if (generate > 0) {
+        std::vector<llama_token> out;
+        int rc = llama_decode(ctx, llama_batch_get_one(tokens.data(), (int32_t) tokens.size()));
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        for (int i = 0; i < generate && rc == 0; ++i) {
+            const float* lg = llama_get_logits_ith(ctx, -1);
+            llama_token best = 0;
+            for (int j = 1; j < n_vocab; ++j)
+                if (lg[j] > lg[best]) best = j;
+            out.push_back(best);
+            rc = llama_decode(ctx, llama_batch_get_one(&out.back(), 1));
+        }
+        std::ofstream gf(d.dir + "/generated.txt");
+        std::string text;
+        for (size_t i = 0; i < out.size(); ++i) {
+            gf << (i ? "," : "") << out[i];
+            char piece[256];
+            const int n = llama_token_to_piece(vocab, out[i], piece, sizeof piece, 0, true);
+            if (n > 0) text.append(piece, (size_t) n);
+        }
+        gf << '\n';
+        std::printf("generated %zu tokens%s: ", out.size(), default_cache ? " (llama.cpp's default cache)" : " (F32 cache)");
+        for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
+        std::printf("\ntext: %s\n", text.c_str());
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return rc == 0 ? 0 : 1;
     }
     d.index.open(d.dir + "/index.txt", std::ios::trunc);
     const int rc = llama_decode(ctx, llama_batch_get_one(tokens.data(), (int32_t) tokens.size()));

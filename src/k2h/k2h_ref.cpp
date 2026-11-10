@@ -10,6 +10,8 @@
 //   --split K: tokens 0 .. K-1 as one batch, then every later token alone against the KV cache (the decode path); the
 //       outputs are joined and compared as one
 //   --logits: every layer and the head; result_norm / result_output are the last token's (as llama.cpp's default)
+//   --generate N: greedy, N tokens after the prompt (argmax, the lowest id on equal logits) with the whole model, the prompt
+//       as one batch and then one token at a time; compared with DIR/generated.txt when the reference has one
 //   strata-k2h-ref MODEL.gguf --tokens 0,864,7169 [--layers N]
 //       the same forward without a reference: each tensor's RMS and its non-finite count
 //
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
     bool isolate = false;
     int64_t split = 0;
     bool logits = false;
+    int64_t generate = 0;
     int threads = (int) std::max(1u, std::thread::hardware_concurrency());
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -80,6 +83,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--isolate") isolate = true;
         else if (a == "--logits") logits = true;
+        else if (a == "--generate" && i + 1 < argc) generate = std::atoll(argv[++i]);
         else if (a == "--split" && i + 1 < argc) split = std::atoll(argv[++i]);
         else if (path.empty() && a[0] != '-') path = a;
         else {
@@ -103,6 +107,33 @@ int main(int argc, char** argv) {
         if (!strata::k2h::geometry_from_gguf(m.meta(), g, err) || !strata::k2h::map_weights(m, g, w, err)) {
             std::printf("k2h-ref: %s\n", err.c_str());
             return 1;
+        }
+        if (generate > 0) {
+            const int64_t T = (int64_t) tokens.size();
+            strata::k2h::ref::Forward gen(g, w, T + generate, threads);
+            std::vector<int32_t> out;
+            std::vector<float> x = gen.run(tokens, 0, g.n_layers);
+            for (int64_t i = 0; i < generate; ++i) {
+                const std::vector<float> lg = gen.head(x, (int64_t) x.size() / g.n_embd);
+                int32_t best = 0;
+                for (int32_t j = 1; j < (int32_t) lg.size(); ++j)
+                    if (lg[(size_t) j] > lg[(size_t) best]) best = j;
+                out.push_back(best);
+                if (i + 1 < generate) x = gen.run({best}, T + i, g.n_layers);
+            }
+            std::string ids;
+            for (size_t i = 0; i < out.size(); ++i) ids += (i ? "," : "") + std::to_string(out[i]);
+            std::printf("k2h-ref: generated %lld tokens: %s\n", (long long) generate, ids.c_str());
+            std::ifstream rf(ref_dir.empty() ? std::string() : ref_dir + "/generated.txt");
+            std::string line;
+            if (rf && std::getline(rf, line)) {
+                const std::vector<int32_t> theirs = parse_ids(line);
+                size_t same = 0;
+                while (same < out.size() && same < theirs.size() && out[same] == theirs[same]) ++same;
+                std::printf("k2h-ref: llama.cpp generated %s\nk2h-ref: the first %zu of %zu tokens are the same\n", line.c_str(), same,
+                            out.size());
+            }
+            return 0;
         }
         if (logits) layers = g.n_layers;
         if (layers < 0) layers = g.n_dense_lead;

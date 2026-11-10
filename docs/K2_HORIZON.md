@@ -163,3 +163,20 @@ Read from the code, not yet built or run for K2 (no GPU here); unconfirmed stati
 The smallest K2 path from here: the routed experts repacked at load into native blobs in host memory (14.9 GiB) and
 computed by the CPU pool, with zero VRAM slots to begin with (the minimum expert cache); the routers on the CPU with
 `argsort_desc` (100 and 64 values per token), which also keeps llama.cpp's CPU choice on ties.
+
+### Greedy generation, 32 tokens
+
+`strata-k2h-ref MODEL --ref DIR --generate 32` (the prompt as one batch, then one token at a time against the KV
+cache) against `llama-k2h-dump MODEL DIR --prompt ... --generate 32`, both taking the highest logit (the lowest id on
+equal logits). Same prompt, same machine, 2026-11-10:
+
+| | Tokens the same as the CPU reference's |
+|---|---|
+| llama.cpp b11454 CPU, F32 KV cache, flash attention off | 32 of 32 |
+| llama.cpp b11454 CPU, its default context (F16 KV cache, flash attention auto) | 32 of 32 |
+
+The text: " Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Germany is Berlin. The
+capital of the United Kingdom is London." One prompt only, and an easy one to predict: the router choices that differ
+between the two (above) did not change a greedy token here. More prompts come with the generation step. The CPU
+reference took 2 min 55 s for the prompt and 32 tokens (4 cores, the file larger than the RAM, no SIMD): it is a
+checking tool, not a way to serve the model.
