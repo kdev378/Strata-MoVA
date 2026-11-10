@@ -22,8 +22,8 @@
 // With the rounding off, the layer outputs differ from llama.cpp by several percent after two layers (measured on
 // K2-Horizon-MoVA-36B-A4B Q4_K_M, docs/K2_HORIZON.md), so the comparison needs it on.
 //
-// Steps done: the dense layers (0 .. leading_dense_block_count - 1) and the attention of every layer, MoVA included
-// (step 5).  A MoE FFN is refused after the attention (step 6 of the port).
+// Steps done: every layer: the dense layers (0 .. leading_dense_block_count - 1), the attention of every layer with MoVA
+// (step 5), the MoE FFN with its shared expert (step 6), and the head (final grouped norm, output.weight).
 //
 // MoVA and the routers: the value router's logits (attn_v_gate, a matmul like any other), sigmoid, the selection bias
 // added for the choice only, the top k in ggml's own sort order (argsort_desc), the chosen experts' unbiased
@@ -183,13 +183,16 @@ inline float sigmoid(float x) { return 1.f / (1.f + expf(-x)); }   // op_sigmoid
 
 /// One router (llama.cpp build_moe_ffn / build_routed_value): gating of the logits, the selection bias added for the choice
 /// only, the top k in ggml's order, the chosen experts' unbiased probabilities, renormalised (sum clamped at 2^-14) and
-/// scaled.  ids / weights are [T][k].  The intermediate tensors go to `emit` under `prefix` + llama.cpp's suffixes.
+/// scaled.  ids / weights are [T][k].  The intermediate tensors go to `emit` with llama.cpp's suffixes, which differ between
+/// its two routers: build_routed_value (MoVA, `ffn_names` false) names the final weights "weights"; build_moe_ffn
+/// (`ffn_names` true) names the chosen raw probabilities "weights", adds "weights_sum" / "weights_sum_clamped", and names the
+/// final ones "weights_scaled".
 struct Routed {
     std::vector<int32_t> ids;
     std::vector<float> weights;
 };
 inline Routed route(const float* logits, const float* bias, int64_t T, int64_t n, int64_t k, Gating gating, bool norm,
-                    double scale, const std::function<void(const char*, const std::vector<float>&)>& emit) {
+                    double scale, const std::function<void(const char*, const std::vector<float>&)>& emit, bool ffn_names = false) {
     std::vector<float> probs((size_t) (T * n));
     for (int64_t t = 0; t < T; ++t) {
         const float* lg = logits + t * n;
@@ -225,18 +228,25 @@ inline Routed route(const float* logits, const float* bias, int64_t T, int64_t n
     emit("argsort", order);
     emit("topk", top);
     emit("probs", probs);
+    if (ffn_names) emit("weights", r.weights);
     if (norm) {
+        std::vector<float> sums((size_t) T), clamped((size_t) T);
         for (int64_t t = 0; t < T; ++t) {
             double sum = 0;   // ggml_vec_sum_f32: a double sum, stored as float
             for (int64_t j = 0; j < k; ++j) sum += r.weights[(size_t) (t * k + j)];
-            const float s = std::max((float) sum, 6.103515625e-5f);
-            for (int64_t j = 0; j < k; ++j) r.weights[(size_t) (t * k + j)] /= s;
+            sums[(size_t) t] = (float) sum;
+            clamped[(size_t) t] = std::max((float) sum, 6.103515625e-5f);
+            for (int64_t j = 0; j < k; ++j) r.weights[(size_t) (t * k + j)] /= clamped[(size_t) t];
+        }
+        if (ffn_names) {
+            emit("weights_sum", sums);
+            emit("weights_sum_clamped", clamped);
         }
         emit("weights_norm", r.weights);
     }
     if (scale != 0.0 && scale != 1.0)
         for (float& w : r.weights) w *= (float) scale;
-    emit("weights", r.weights);
+    emit(ffn_names ? "weights_scaled" : "weights", r.weights);
     return r;
 }
 
@@ -322,6 +332,21 @@ public:
     /// One layer over the residual stream `x` ([T][n_embd], updated in place) of T tokens at positions pos0 ..
     void run_layer(int64_t l, std::vector<float>& x, int64_t T, int64_t pos0, const Hook& hook = {}) { layer(l, x, T, pos0, hook); }
 
+    /// The head over the residual stream's last token (x [T][n_embd]): the grouped norm with output_norm, then output.weight.
+    /// Returns the n_vocab logits; "result_norm" and "result_output" go to the hook (one row, as llama.cpp outputs only the
+    /// last token by default).
+    std::vector<float> head(const std::vector<float>& x, int64_t T, const Hook& hook = {}) {
+        const int64_t N = g_.n_embd;
+        const std::vector<float> on = vector_of(w_.output_norm);
+        std::vector<float> h((size_t) N);
+        group_rms_norm(&x[(size_t) ((T - 1) * N)], on.data(), h.data(), N, g_.n_norm_groups, (float) g_.rms_eps);
+        if (hook) hook("result_norm", h.data(), 1, N);
+        std::vector<float> logits((size_t) g_.n_vocab);
+        matmul(w_.output, h.data(), 1, logits.data(), threads_, act_);
+        if (hook) hook("result_output", logits.data(), 1, g_.n_vocab);
+        return logits;
+    }
+
     void embed(const std::vector<int32_t>& tokens, float* x) const {
         const TensorRef& E = w_.token_embd;
         int be = 0, bb = 0;
@@ -366,6 +391,65 @@ private:
                 v[(size_t) (t * KV + i)] = acc;
             }
         emit(hook, "Vcur_routed", l, v, T);
+    }
+
+    /// down(silu(gate(x)) * up(x)) for T rows of x through the rows [row0, row0 + F) of 3-D (or 2-D) gate / up tensors and the
+    /// matching down rows; `y` is [T][n_embd].  The intermediates of the first call per layer go to the hook (`prefix`).
+    void swiglu_ffn(const TensorRef& gate, const TensorRef& up, const TensorRef& down, int64_t e, int64_t F, const float* x, int64_t T,
+                    float* y, float* g_out = nullptr, float* u_out = nullptr, float* s_out = nullptr) {
+        const int64_t N = g_.n_embd;
+        std::vector<float> gt((size_t) (T * F)), u((size_t) (T * F));
+        matmul_rows(up, e * F, F, x, T, u.data(), threads_, act_);
+        matmul_rows(gate, e * F, F, x, T, gt.data(), threads_, act_);
+        if (g_out) std::copy(gt.begin(), gt.end(), g_out);
+        if (u_out) std::copy(u.begin(), u.end(), u_out);
+        for (size_t i = 0; i < gt.size(); ++i) gt[i] = silu(gt[i]) * u[i];
+        if (s_out) std::copy(gt.begin(), gt.end(), s_out);
+        matmul_rows(down, e * N, N, gt.data(), T, y, threads_, act_);
+    }
+
+    /// The MoE FFN (llama.cpp build_moe_ffn + the shared expert of k2-horizon.cpp): the router picks n_expert_used of the
+    /// routed experts per token, each chosen expert's down(silu(gate(x)) * up(x)) times its weight, added in the router's
+    /// order; then the shared expert's own SwiGLU FFN added.  `out` is [T][n_embd].
+    void moe(int64_t l, const LayerWeights& L, const std::vector<float>& h, int64_t T, std::vector<float>& out, const Hook& hook) {
+        const int64_t N = g_.n_embd, NE = g_.n_expert, K = g_.n_expert_used, F = g_.n_ff_exp;
+        std::vector<float> logits((size_t) (T * NE));
+        matmul(L.ffn_gate_inp, h.data(), T, logits.data(), threads_, act_);
+        emit(hook, "ffn_moe_logits", l, logits, T);
+        const std::vector<float> bias = L.ffn_exp_probs_b ? vector_of(L.ffn_exp_probs_b) : std::vector<float>();
+        const Routed r = route(logits.data(), bias.empty() ? nullptr : bias.data(), T, NE, K, g_.gating, g_.expert_weights_norm,
+                               g_.expert_weights_scale, [&](const char* what, const std::vector<float>& d) {
+                                   emit(hook, (std::string("ffn_moe_") + what).c_str(), l, d, T);
+                               }, true);
+        std::vector<float> gate((size_t) (T * K * F)), up((size_t) (T * K * F)), act((size_t) (T * K * F));
+        std::vector<float> down((size_t) (T * K * N)), weighted((size_t) (T * K * N));
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t k = 0; k < K; ++k) {
+                const size_t ef = (size_t) ((t * K + k) * F), en = (size_t) ((t * K + k) * N);
+                swiglu_ffn(L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, r.ids[(size_t) (t * K + k)], F, &h[(size_t) (t * N)], 1,
+                           &down[en], &gate[ef], &up[ef], &act[ef]);
+                const float w = r.weights[(size_t) (t * K + k)];
+                for (int64_t i = 0; i < N; ++i) weighted[en + (size_t) i] = down[en + (size_t) i] * w;
+            }
+        emit(hook, "ffn_moe_gate", l, gate, T);
+        emit(hook, "ffn_moe_up", l, up, T);
+        emit(hook, "ffn_moe_swiglu", l, act, T);
+        emit(hook, "ffn_moe_down", l, down, T);
+        emit(hook, "ffn_moe_weighted", l, weighted, T);
+        out.assign((size_t) (T * N), 0.0f);
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t i = 0; i < N; ++i) {
+                float acc = weighted[(size_t) (t * K * N + i)];
+                for (int64_t k = 1; k < K; ++k) acc += weighted[(size_t) ((t * K + k) * N + i)];
+                out[(size_t) (t * N + i)] = acc;
+            }
+        emit(hook, "ffn_moe_out", l, out, T);
+        if (L.ffn_up_shexp) {
+            std::vector<float> sh((size_t) (T * N));
+            swiglu_ffn(L.ffn_gate_shexp, L.ffn_up_shexp, L.ffn_down_shexp, 0, g_.n_ff_shexp, h.data(), T, sh.data());
+            emit(hook, "ffn_shexp", l, sh, T);
+            for (size_t i = 0; i < out.size(); ++i) out[i] += sh[i];
+        }
     }
 
     void layer(int64_t l, std::vector<float>& x, int64_t T, int64_t pos0, const Hook& hook) {
@@ -438,13 +522,18 @@ private:
         for (size_t i = 0; i < x.size(); ++i) x[i] += o[i];
         emit(hook, "ffn_inp", l, x, T);
 
-        if (g_.is_moe_layer(l))
-            throw std::runtime_error("layer " + std::to_string(l) + ": the MoE FFN is not in the CPU reference yet");
-
-        // dense FFN
         const std::vector<float> fn = vector_of(L.ffn_norm);
         for (int64_t t = 0; t < T; ++t) group_rms_norm(&x[(size_t) (t * N)], fn.data(), &h[(size_t) (t * N)], N, g_.n_norm_groups, eps);
         emit(hook, "ffn_norm", l, h, T);
+        if (g_.is_moe_layer(l)) {
+            moe(l, L, h, T, o, hook);
+            emit(hook, "ffn_out", l, o, T);
+            for (size_t i = 0; i < x.size(); ++i) x[i] += o[i];
+            emit(hook, "l_out", l, x, T);
+            return;
+        }
+
+        // dense FFN
         const int64_t F = g_.n_ff_dense;
         std::vector<float> gt((size_t) (T * F)), up((size_t) (T * F));
         matmul(L.ffn_gate, h.data(), T, gt.data(), threads_, act_);

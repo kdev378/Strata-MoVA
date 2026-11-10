@@ -124,3 +124,42 @@ Measured as above (same prompt, same machine), against a 4-layer llama.cpp dump:
 | layers 0-3 in one run | 4.3e-3 | same 4, same order, 6 of 6 tokens (ranks 5 and below differ) | 6.0e-3 | 1.6e-4 | 0 |
 
 (rms rel as above.) The MoE FFN of layer 3 comes next; the reference stops after `ffn_inp-3` until then.
+
+### The MoE FFN, and the whole model
+
+The FFN router and the experts as llama.cpp's `build_moe_ffn`: `ffn_gate_inp` logits (F32, so no activation
+rounding), sigmoid, `exp_probs_b` for the choice only, the top 8, renormalised and times 2.5; each chosen expert's
+`down(silu(gate(x)) * up(x))` times its weight, the 8 added in the router's order; then the shared expert's own SwiGLU
+FFN added (no gate). The head is the grouped norm with `output_norm`, then `output.weight`.
+
+Measured as above (same prompt, same machine), against a whole-model llama.cpp dump (1,559 tensors; llama.cpp keeps
+only the last token's row from layer 47's `ffn_inp` on, so those are compared on that row):
+
+| Run | Layer 3 `l_out` | Layer 47 `l_out` | Logits (`result_output`) | Next token | Router choices (90: 45 MoVA + 45 FFN) |
+|---|---|---|---|---|---|
+| each layer from llama.cpp's input (`--isolate`) | 7.1e-8 | 1.2e-7 | 2.2e-7, top 5 in the same order | same (11511) | all 90 the same set in the same order, on every token |
+| all 48 layers in one run | 1.9e-4 | 5.5e-2 | 5.8e-2, the same top 5 (ranks 3 and 4 swapped) | same (11511) | 38 of 90 the same set on every token; 52 differ on 1 or 2 of the 6 tokens |
+
+(rms rel as above; 0 non-finite values in every tensor.) Each layer computes what llama.cpp computes. Run as one, the
+small rounding differences of the first layers (1e-4) are enough to change some router choices from layer 4 on: the
+routers have near-ties (the coarse selection biases above), so a different expert wins by a hair. Every later layer
+then works on a slightly different input. llama.cpp's own CPU and CUDA builds differ in their rounding in the same way,
+so the same effect is to be expected between them.
+
+## Reusing Strata's expert code (step 6 of the port)
+
+Read from the code, not yet built or run for K2 (no GPU here); unconfirmed static analysis.
+
+| Part | For K2 | Why |
+|---|---|---|
+| CPU native experts (`kernels/cpu/native_expert`: `native_fmt`, `native_gu_rows`, `native_down_rows`) | reusable | GGUF-form blob `[gate | up | down]`, any type ggml-cpu has a dot for (Q4_K gate/up, Q4_K or Q6_K down), activations in the type's `vec_dot_type` (Q8_K, as llama.cpp's CPU), `silu(gate) * up` then down: K2's SwiGLU. n_ff 768 is three Q8_K blocks; the activation buffers (`kNativeActBytes` for 2560, `kNativeHBytes` 1024 bytes >= 876 for 768) are large enough. |
+| CPU expert pool (`kernels/cpu/pool`: `run_split_multi_native`) | reusable | The same entry point Qwen3.6's hybrid mode uses for the experts not in VRAM. |
+| GPU grouped experts (`native_expert_grouped`) | gate/up yes, down partly | Q4_K gate/up is in `STRATA_GU_FMTS`. Q6_K down is in `STRATA_D_FMTS` (with `STRATA_Q6K_EXPERTS`, on by default), Q4_K down is not: 24 of K2's 45 layers have Q4_K `ffn_down_exps`. Adding type 12 to the down list is likely a one-line change, but it needs a CUDA and HIP build and a parity test. |
+| The weighted combine (`native_moe_combine`) | reusable | k up to 15, the shared expert added once unweighted: K2's 8 experts plus an ungated shared expert. |
+| GPU routers (`native_router_topk`, Qwen3.6's `k_route_group`) | not reusable | softmax only, without a selection bias, and only (512, 10) and (256, 8). K2 needs sigmoid + bias for (100, 8) and (64, 4). |
+| Flash-Next's VRAM expert tier (`core/expert_cache`) | not reusable | Part of the Flash-Next session: a frequency profile file for 48 x 512 experts and the verify-window kernels. |
+| Qwen3.6's placement (`place_experts`, hybrid mode in `q36_engine.cu`) | the design, not the code | It lives inside Qwen3.6's engine (its Model and Engine structs, MTP, the packed Q8_0 copies). The idea carries over: every expert in host memory, as many per-layer VRAM slots as fit, the rest on the CPU pool. |
+
+The smallest K2 path from here: the routed experts repacked at load into native blobs in host memory (14.9 GiB) and
+computed by the CPU pool, with zero VRAM slots to begin with (the minimum expert cache); the routers on the CPU with
+`argsort_desc` (100 and 64 values per token), which also keeps llama.cpp's CPU choice on ties.

@@ -9,6 +9,7 @@
 //       its own and not the earlier layers' carried forward
 //   --split K: tokens 0 .. K-1 as one batch, then every later token alone against the KV cache (the decode path); the
 //       outputs are joined and compared as one
+//   --logits: every layer and the head; result_norm / result_output are the last token's (as llama.cpp's default)
 //   strata-k2h-ref MODEL.gguf --tokens 0,864,7169 [--layers N]
 //       the same forward without a reference: each tensor's RMS and its non-finite count
 //
@@ -69,6 +70,7 @@ int main(int argc, char** argv) {
     int64_t layers = -1;
     bool isolate = false;
     int64_t split = 0;
+    bool logits = false;
     int threads = (int) std::max(1u, std::thread::hardware_concurrency());
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -77,6 +79,7 @@ int main(int argc, char** argv) {
         else if (a == "--layers" && i + 1 < argc) layers = std::atoll(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
         else if (a == "--isolate") isolate = true;
+        else if (a == "--logits") logits = true;
         else if (a == "--split" && i + 1 < argc) split = std::atoll(argv[++i]);
         else if (path.empty() && a[0] != '-') path = a;
         else {
@@ -101,6 +104,7 @@ int main(int argc, char** argv) {
             std::printf("k2h-ref: %s\n", err.c_str());
             return 1;
         }
+        if (logits) layers = g.n_layers;
         if (layers < 0) layers = g.n_dense_lead;
         std::string tl;
         for (size_t i = 0; i < tokens.size(); ++i) tl += (i ? "," : "") + std::to_string(tokens[i]);
@@ -152,6 +156,7 @@ int main(int argc, char** argv) {
                 }
                 fwd.run_layer(l, x, n, p0, hook);
             }
+            if (logits && p0 + n == (int64_t) tokens.size()) fwd.head(x, n, hook);
         }
         } catch (const std::exception& e) {
             stopped = e.what();   // compare what was computed before the stop, then fail
@@ -159,8 +164,15 @@ int main(int argc, char** argv) {
         }
         for (const std::string& name : order) {
             const std::vector<float>& v = got[name];
-            const int64_t n = (int64_t) v.size();
+            int64_t n = (int64_t) v.size();
             const float* d = v.data();
+            int64_t rows = T;   // the tokens this comparison covers
+            // llama.cpp keeps only the last token's row from the last layer's ffn_inp on (inp_out_ids): compare that row
+            if (const auto rt = ref.find(name); rt != ref.end() && rt->second.elements * T == n && T > 1) {
+                d += n - rt->second.elements;
+                n = rt->second.elements;
+                rows = 1;
+            }
             size_t nonfinite = 0;
             double ss = 0;
             for (int64_t i = 0; i < n; ++i) {
@@ -191,17 +203,25 @@ int main(int argc, char** argv) {
             const double rel = max_ref > 0 ? max_diff / max_ref : max_diff;
             const double rms_rel = ssr > 0 ? std::sqrt(ssd / ssr) : std::sqrt(ssd);
             std::string sets;
+            if (name == "result_output") {   // the next-token logits: argmax and the top 5 of each side
+                const std::vector<int32_t> mine = strata::k2h::ref::argsort_desc(d, n), theirs = strata::k2h::ref::argsort_desc(r.data.data(), n);
+                sets = "   argmax " + std::to_string(mine[0]) + (mine[0] == theirs[0] ? " = " : " != ") + std::to_string(theirs[0]) +
+                       "; top 5 Strata";
+                for (int i = 0; i < 5; ++i) sets += " " + std::to_string(mine[(size_t) i]);
+                sets += " / llama.cpp";
+                for (int i = 0; i < 5; ++i) sets += " " + std::to_string(theirs[(size_t) i]);
+            }
             if (name.find("_topk-") != std::string::npos) {   // the routers' choices: tokens whose chosen set differs
-                const int64_t T = (int64_t) tokens.size(), k = n / T;
+                const int64_t k = n / rows;
                 int64_t differ = 0, order = 0;
-                for (int64_t t = 0; t < T; ++t) {
+                for (int64_t t = 0; t < rows; ++t) {
                     std::vector<float> a(d + t * k, d + (t + 1) * k), b(r.data.begin() + t * k, r.data.begin() + (t + 1) * k);
                     order += a != b ? 1 : 0;
                     std::sort(a.begin(), a.end());
                     std::sort(b.begin(), b.end());
                     differ += a != b ? 1 : 0;
                 }
-                sets = "   chosen set differs on " + std::to_string(differ) + " of " + std::to_string(T) + " tokens, order on " +
+                sets = "   chosen set differs on " + std::to_string(differ) + " of " + std::to_string(rows) + " tokens, order on " +
                        std::to_string(order);
             }
             std::printf("  %-14s %10lld %12.5g %12.5g %10.3g %10.3g %6zu%s\n", name.c_str(), (long long) n, max_ref, max_diff, rel,
