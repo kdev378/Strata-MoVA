@@ -316,3 +316,38 @@ Checked here (no GPU): `iq_kernels.cu` compiles with nvcc 13.5 for compute_86 (t
 `native_down_kernel<12>` and `native_down_multi_kernel<12, false|true, false>` (436 -> 439 kernels; every other kernel's
 name the same). Not checked: a full CUDA / HIP build, and `native_grouped_parity` on a GPU, which compares the kernel's
 results with the CPU's; run it on the card before the GPU path uses these kernels.
+
+## The GPU: strata-k2h --gpu (CUDA builds)
+
+In a CUDA build (`-DSTRATA_ENABLE_CUDA=ON`) strata-k2h has a GPU side (`src/k2h/k2h_gpu.cu`). With `--gpu [N]` it copies
+weights to GPU N's VRAM while they fit the budget (`--gpu-vram GiB`; default the free VRAM less 768 MiB), in this
+order: every layer's attention projections (0.86 GiB), the output head (0.49), the shared experts and dense FFNs (0.21),
+the MoVA value experts and their routers (3.96), then whole layers of routed experts (0.33 GiB each). Those products
+run on the GPU with Strata's native MMVQ (`native_*_f32`: llama.cpp's CUDA MMVQ, activations as Q8_1, up to 8 tokens a
+call). Everything else stays on the CPU as before: the F32 routers, the attention itself and the KV cache, the norms,
+and whatever did not fit. On an 8 GB card the budget is about 6.4 GiB, which holds everything before the routed experts
+and about two layers of those (from the sizes above; not measured on a card).
+
+This is the simplest GPU side that can work, not a fast one: each product copies its activations to the card and its
+result back, and waits. The attention and the KV cache are not on the GPU yet.
+
+Checked here (no GPU): `k2h_gpu.cu` and the engine with `STRATA_K2H_GPU` compile (nvcc 13.5 from pip, compute_86 PTX;
+g++ with -Wall -Wextra -Werror), and link with `native_mmvq.cu`, `iq_kernels.cu`, `verify_kernels.cu`, ggml-cpu and
+libcudart into a working program: `--gpu` says "no CUDA device" and stops; without `--gpu` the same program gives the 32
+greedy tokens above, the same as llama.cpp. Not checked: anything on a GPU.
+
+To check it on the card (an RTX 3070 here):
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build --target strata-k2h native_grouped_parity
+./build/native_grouped_parity                       # the grouped expert kernels, Q4_K downs included, against the CPU
+M=K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf
+./build/strata-k2h --model $M --gpu --gpu-check     # each held weight's product on the GPU against ggml-cpu: rms rel < 0.02
+./build/strata-k2h --model $M --gpu --tokens 0,864,7169,331,8465,395 --n 32
+#   expected (llama.cpp CPU and strata-k2h CPU): 11511,15,589,7169,331,17710,395,27438,15,589,7169,331,21257,395,24875,15,
+#   589,7169,331,14038,395,24240,15,589,7169,331,293,4216,14729,395,7048,15
+```
+
+To serve it with the GPU, add `"--gpu"` to the config's `args`. Setup builds the CPU-only engine; a GPU build is the
+command above.

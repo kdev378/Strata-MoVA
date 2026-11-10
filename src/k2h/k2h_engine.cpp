@@ -22,10 +22,21 @@
 //       serve/server.py's engine protocol: READY <ctx> stop; GEN <max_new> [key=value ...] <id,id,...> -> PP / T <id> / DONE;
 //       STOP ends a generation.  Sampling keys: temperature, top_k, top_p, min_p, seed (greedy without a temperature).
 //
-// Not here (yet): the GPU, vision, batch slots, drafting, session files.
+//   --gpu [N] (a CUDA build only): weights copied to GPU N's VRAM, in this order while they fit the budget (--gpu-vram GiB;
+//       default the free VRAM less 768 MiB): every layer's attention projections, the output head, the shared experts
+//       and the dense FFNs, the MoVA value experts, then whole layers of routed experts.  Their products run there with
+//       Strata's native MMVQ (llama.cpp's CUDA MMVQ, activations as Q8_1); the rest (the F32 routers, the attention
+//       itself, the norms, whatever did not fit) stays on the CPU.  --gpu-check compares the GPU's products with the
+//       CPU's on random activations and exits.
+//
+// Not here (yet): vision, batch slots, drafting, session files; the attention and the KV cache on the GPU.
 #include "strata/k2h/cpu_ref.hpp"
 #include "strata/k2h/geometry.hpp"
 #include "strata/k2h/layout.hpp"
+
+#if defined(STRATA_K2H_GPU)
+#include "strata/k2h/gpu.hpp"
+#endif
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -33,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -151,6 +163,95 @@ public:
 
     int64_t ctx() const { return n_ctx_; }
 
+#if defined(STRATA_K2H_GPU)
+    /// Copies weights to the GPU in the order above while they fit; a summary to stderr.
+    void place_on_gpu(std::unique_ptr<strata::k2h::Gpu> gpu, size_t budget) {
+        gpu_ = std::move(gpu);
+        gpu_->set_budget(budget);
+        struct Part {
+            const char* what;
+            size_t bytes = 0;
+            int held = 0, total = 0;
+        };
+        std::vector<Part> parts = {{"attention"}, {"output head"}, {"shared experts and dense FFN"}, {"MoVA value experts"},
+                                   {"routed experts"}};
+        auto take = [&](size_t part, const TensorRef& t) {
+            if (!t) return true;
+            ++parts[part].total;
+            if (!gpu_->hold(t)) return false;
+            ++parts[part].held;
+            parts[part].bytes += (size_t) t.bytes();
+            return true;
+        };
+        for (const LayerWeights& L : w_.layers)
+            for (const TensorRef* t : {&L.attn_q, &L.attn_k, &L.attn_v, &L.attn_gate, &L.attn_output}) take(0, *t);
+        take(1, w_.output);
+        for (const LayerWeights& L : w_.layers)
+            for (const TensorRef* t : {&L.ffn_gate_shexp, &L.ffn_up_shexp, &L.ffn_down_shexp, &L.ffn_gate, &L.ffn_up, &L.ffn_down})
+                take(2, *t);
+        for (const LayerWeights& L : w_.layers)
+            for (const TensorRef* t : {&L.attn_v_gate, &L.attn_v_exps}) take(3, *t);
+        for (const LayerWeights& L : w_.layers) {   // a layer's three routed tensors together, or none of them
+            if (!L.ffn_up_exps) continue;
+            parts[4].total += 3;
+            const size_t need = (size_t) (L.ffn_up_exps.bytes() + L.ffn_gate_exps.bytes() + L.ffn_down_exps.bytes());
+            if (gpu_->held_bytes() + need > budget) continue;
+            for (const TensorRef* t : {&L.ffn_up_exps, &L.ffn_gate_exps, &L.ffn_down_exps})
+                if (gpu_->hold(*t)) {
+                    ++parts[4].held;
+                    parts[4].bytes += (size_t) t->bytes();
+                }
+        }
+        std::fprintf(stderr, "strata-k2h: GPU %s: %.2f GiB of weights in VRAM (budget %.2f GiB)\n", gpu_->device_name().c_str(),
+                     gpu_->held_bytes() / 1073741824.0, budget / 1073741824.0);
+        for (const Part& pt : parts)
+            std::fprintf(stderr, "  %-30s %3d of %3d tensors, %.2f GiB\n", pt.what, pt.held, pt.total, pt.bytes / 1073741824.0);
+    }
+
+    /// The GPU's products against the CPU's for one held tensor of each kind, on random activations (T tokens).
+    bool gpu_check(int64_t T) {
+        std::vector<const TensorRef*> pick;
+        auto add = [&](const TensorRef& t) {
+            if (t) pick.push_back(&t);
+        };
+        const LayerWeights& L0 = w_.layers.front();
+        const LayerWeights& Lm = w_.layers[(size_t) std::min<int64_t>(g_.n_dense_lead, g_.n_layers - 1)];
+        add(L0.attn_q), add(L0.attn_output), add(L0.ffn_down), add(Lm.attn_v_exps), add(Lm.ffn_down_shexp), add(Lm.ffn_down_exps),
+            add(w_.output);
+        std::mt19937 rng(7);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        bool all = true;
+        for (const TensorRef* t : pick) {
+            const int64_t n_in = (int64_t) t->info->shape[0];
+            const int64_t n_out = std::min<int64_t>((int64_t) t->info->shape[1], 4096);
+            std::vector<float> x((size_t) (T * n_in)), a((size_t) (T * n_out)), b((size_t) (T * n_out));
+            for (float& v : x) v = nd(rng);
+            const bool on_gpu = gpu_->mv(*t, 0, n_out, x.data(), T, a.data());
+            if (!on_gpu) {
+                std::printf("  %-32s %-5s not on the GPU\n", t->name().c_str(), t->info->type_name());
+                continue;
+            }
+            auto keep = std::move(gpu_);
+            mv(*t, 0, n_out, x.data(), T, b.data());   // the CPU's (ggml-cpu)
+            gpu_ = std::move(keep);
+            double max_ref = 0, max_diff = 0, ssd = 0, ssr = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                max_ref = std::max(max_ref, (double) std::fabs(b[i]));
+                max_diff = std::max(max_diff, (double) std::fabs(a[i] - b[i]));
+                ssd += (double) (a[i] - b[i]) * (a[i] - b[i]);
+                ssr += (double) b[i] * b[i];
+            }
+            const double rms_rel = ssr > 0 ? std::sqrt(ssd / ssr) : 0;
+            const bool good = std::isfinite(rms_rel) && rms_rel < 0.02;
+            all = all && good;
+            std::printf("  %-32s %-5s %lld x %lld, %lld tokens: rms rel %.2e, max diff %.3g of %.3g  %s\n", t->name().c_str(),
+                        t->info->type_name(), (long long) n_out, (long long) n_in, (long long) T, rms_rel, max_diff, max_ref,
+                        good ? "ok" : "FAIL");
+        }
+        return all;
+    }
+#endif
+
     /// tokens at positions pos0 .. through every layer; the logits of the last one into `logits` (n_vocab).
     void forward(const std::vector<int32_t>& tokens, int64_t pos0, std::vector<float>& logits) {
         const int64_t T = (int64_t) tokens.size(), N = g_.n_embd;
@@ -174,8 +275,12 @@ private:
         }
     }
 
-    /// y[t][j] = W[row0 + j] . x[t] for j < n_out, T tokens, through ggml-cpu (activations to vec_dot_type, then vec_dot).
+    /// y[t][j] = W[row0 + j] . x[t] for j < n_out, T tokens: on the GPU when it holds W, else through ggml-cpu (activations
+    /// to vec_dot_type, then vec_dot).
     void mv(const TensorRef& W, int64_t row0, int64_t n_out, const float* x, int64_t T, float* y) {
+#if defined(STRATA_K2H_GPU)
+        if (gpu_ && gpu_->mv(W, row0, n_out, x, T, y)) return;
+#endif
         const int64_t n_in = (int64_t) W.info->shape[0];
         const ggml_type wt = (ggml_type) W.type();
         const ggml_type_traits_cpu* tr = ggml_get_type_traits_cpu(wt);
@@ -347,6 +452,9 @@ private:
     std::vector<std::vector<float>> k_, v_;
     std::vector<std::vector<float>> norms_attn_, norms_ffn_, v_bias_, e_bias_;
     std::vector<float> norm_out_;
+#if defined(STRATA_K2H_GPU)
+    std::unique_ptr<strata::k2h::Gpu> gpu_;
+#endif
 };
 
 // ------------------------------------------------------------------------------------------------ sampling
@@ -577,14 +685,17 @@ private:
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: strata-k2h --model M.gguf (--serve | --tokens IDS [--n N]) [--ctx C] [--threads T] [--eos IDS]\n"
+                 "usage: strata-k2h --model M.gguf (--serve | --tokens IDS [--n N] | --gpu-check) [--ctx C] [--threads T] [--eos IDS]\n"
+                 "                  [--gpu [N] [--gpu-vram GiB]] [--dump-logits FILE]\n"
                  "  K2 Horizon (k2-horizon) on the CPU; docs/K2_HORIZON.md\n");
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string model, tokens, eos_list = "1,250019", dump_logits;
-    bool serve = false;
+    bool serve = false, gpu_check = false;
+    int gpu = -1;
+    double gpu_vram = -1;
     long long n_gen = 16, ctx = 2048;
     int threads = (int) std::max(1u, std::thread::hardware_concurrency());
     for (int i = 1; i < argc; ++i) {
@@ -603,6 +714,9 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--eos") eos_list = next();
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--gpu") gpu = (i + 1 < argc && std::isdigit((unsigned char) argv[i + 1][0])) ? std::atoi(argv[++i]) : 0;
+        else if (a == "--gpu-vram") gpu_vram = std::atof(next().c_str());
+        else if (a == "--gpu-check") gpu_check = true;
         else if (a == "--serve") serve = true;
         else if (a == "--help" || a == "-h") {
             usage();
@@ -613,7 +727,15 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (model.empty() || (!serve && tokens.empty())) {
+#if !defined(STRATA_K2H_GPU)
+    (void) gpu_vram;
+    if (gpu >= 0 || gpu_check) {
+        std::fprintf(stderr, "strata-k2h: --gpu / --gpu-check: this build has no GPU side (build with CUDA)\n");
+        return 2;
+    }
+#endif
+    if (gpu_check && gpu < 0) gpu = 0;
+    if (model.empty() || (!serve && !gpu_check && tokens.empty())) {
         usage();
         return 2;
     }
@@ -630,6 +752,25 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata-k2h: %s\n", strata::k2h::describe(g).c_str());
         if (ctx <= 0) ctx = 2048;
         Engine E(g, w, ctx, threads);
+#if defined(STRATA_K2H_GPU)
+        if (gpu >= 0) {
+            std::string gerr;
+            auto dev = strata::k2h::Gpu::open(gpu, gerr);
+            if (!dev) {
+                std::fprintf(stderr, "strata-k2h: --gpu %d: %s\n", gpu, gerr.c_str());
+                return 1;
+            }
+            const size_t reserve = (size_t) 768 << 20, fr = dev->free_vram();
+            const size_t budget = gpu_vram >= 0 ? (size_t) (gpu_vram * 1073741824.0) : (fr > reserve ? fr - reserve : 0);
+            E.place_on_gpu(std::move(dev), budget);
+            if (gpu_check) {
+                std::printf("strata-k2h --gpu-check: the GPU's products against the CPU's (ggml-cpu), random activations\n");
+                const bool good = E.gpu_check(1) && E.gpu_check(5);
+                std::printf("strata-k2h --gpu-check: %s\n", good ? "ok" : "FAIL");
+                return good ? 0 : 1;
+            }
+        }
+#endif
         std::fprintf(stderr, "strata-k2h: ready in %.1f s: context %lld, %d threads, KV cache %.2f GiB (F32), weights read in place (mmap)\n",
                      ms_since(t0) / 1000.0, ctx, threads, 2.0 * (double) g.n_layers * (double) ctx * (double) g.n_embd_kv() * 4 / (1u << 30));
         bool ok = false;
