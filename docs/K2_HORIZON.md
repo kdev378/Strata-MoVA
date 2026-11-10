@@ -180,3 +180,30 @@ capital of the United Kingdom is London." One prompt only, and an easy one to pr
 between the two (above) did not change a greedy token here. More prompts come with the generation step. The CPU
 reference took 2 min 55 s for the prompt and 32 tokens (4 cores, the file larger than the RAM, no SIMD): it is a
 checking tool, not a way to serve the model.
+
+## strata-k2h, the CPU engine
+
+`strata-k2h` (`src/k2h/k2h_engine.cpp`) runs K2 Horizon on the CPU. It is the minimum viable engine: it runs the model,
+it is not fast, and it does not use the GPU yet.
+
+- Every matrix product goes through ggml-cpu's own kernels: the activations rounded to the weight type's
+  `vec_dot_type` with its `from_float`, then its `vec_dot` per weight row. These are the functions llama.cpp's CPU
+  backend calls.
+- The weights are read in place from the GGUF's mmap. A routed expert's rows are a slice of its layer's tensor: no
+  repack, no copy. The tokens of a batch that chose the same expert go through it together.
+- The routers run on the CPU in ggml's CPU top-k order (the CPU reference's `route`). MoVA runs on the CPU.
+- F32 KV cache for `--ctx` positions (2048: 0.75 GiB). A request whose ids start with the previous request's reuses
+  that prefix.
+- `--tokens IDS --n N`: greedy check mode. `--serve`: serve/server.py's engine protocol (`READY <ctx> stop`,
+  `GEN <max_new> [key=value ...] <ids>` -> `PP` / `T <id>` / `DONE`, `STOP`). Ends on `--eos` (default 1 and
+  250019, `<|ifm|endoftext|>` and `<|ifm|im_end|>`). Sampling: temperature, top_k, top_p, min_p, seed; greedy
+  without a temperature.
+
+Measured 2026-11-10 on the reference file, 4-core cloud VM with 15 GB of RAM (the 22 GB file does not fit in it):
+
+| | Result |
+|---|---|
+| Greedy, 32 tokens after "The capital of France is", against llama.cpp b11454 CPU | 32 of 32 the same |
+| First step's top 5 | the same 5 as llama.cpp (ranks 3 and 4 swapped, as in the CPU reference) |
+| Decode, cold page cache (first run) | 1.71 tokens/s |
+| Decode, warm page cache (serve, later requests) | 4.7 to 5.4 tokens/s |
