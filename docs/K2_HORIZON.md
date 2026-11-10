@@ -210,7 +210,23 @@ Measured 2026-11-10 on the reference file, 4-core cloud VM with 15 GB of RAM (th
 
 ## Serving it (localhost API)
 
-K2 Horizon is not offered by setup or `strata launch` yet. From a source build:
+From a source checkout, setup installs it when it is named (it is not in setup's menu, the model lists, `strata launch` or
+the app, and nothing else changes for the other models):
+
+```sh
+python setup.py --family k2h --model Q4_K_M          # add --gguf-dir DIR to use a file you already have
+```
+
+It compiles `strata-k2h` for this CPU (`build-k2h/`; no GPU and no llama.cpp needed), downloads IFM's file at the pinned
+revision and checks its size and SHA-256, makes the tokenizer folder, and writes `strata-k2h-q4_k_m.json` and the start
+script `run-k2h-q4_k_m.sh` (`.bat` on Windows). `--context` sets the context (2048 by default; the KV cache takes 0.75 GiB
+of RAM per 2048 tokens). Checked on the VM above: setup from `--gguf-dir`, then the start script, then one request
+("Say hello in French, one word." -> "Bonjour", stop).
+
+`strata launch` and the app do not offer it: they read setup's model tables, and a CPU-only model in development should
+not appear in their lists. That waits for the GPU path.
+
+The manual way, without setup:
 
 1. Build `strata-k2h` (CMake target, CPU build; it needs `STRATA_NATIVE_EXPERTS`, on by default).
 2. Make the tokenizer folder from the GGUF: `python tools/k2h/make_pack.py K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf k2pack`.

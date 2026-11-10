@@ -99,6 +99,7 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "IFM/K2-Horizon-MoVA-36B-A4B-GGUF": "00cce3151bdce384661cb33603853ccfe6209de9",                  # 2026-10-15 (K2 Horizon, in development)
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "8a6ec9cf118e785a362ea94ee123c61c70553be6",             # 2026-10-30 (adds UD-IQ1_S / UD-IQ1_M; every file pinned from the 2026-10-20 commit has the same size and SHA-256 here)
@@ -778,6 +779,25 @@ OWN_PATH_FAMILIES = {
                "vision": True, "state_gb": 0.07}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
+
+# IFM's K2 Horizon (GGUF architecture k2-horizon), IFM's own GGUF: in development (docs/K2_HORIZON.md).  Its engine,
+# strata-k2h, runs on the CPU only for now and is compiled here (no GPU, no llama.cpp needed).  Installed only when named
+# (--family k2h): not in the menu, the model lists, strata launch or the app (PREVIEW_ONLY_FAMILIES is read by nothing
+# else).  Only the size the port was checked on is offered.
+K2H_FILES = {
+    "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf": (22368011616, "513dd78590ac29135a7cea5a99865d57d65291b1f857a8904fb9b1878d4f4cbd"),
+}
+PREVIEW_ONLY_FAMILIES = {
+    "k2h": {"title": "K2-Horizon-MoVA-36B-A4B", "by": "IFM; IFM's own GGUF", "arch": "k2-horizon",
+            "about": "36B mixture of experts with 4B active (100 experts, top-8; MoVA: 64 value experts in the attention, "
+                     "top-4). IN DEVELOPMENT: the CPU only, a few tokens a second",
+            "hf": hf("IFM/K2-Horizon-MoVA-36B-A4B-GGUF"), "file": "K2-Horizon-MoVA-36B-A4B-{q}.gguf", "tag": "k2h-",
+            "name": "k2-horizon-mova-36b-a4b", "license": "Apache 2.0: https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B",
+            # RAM: the engine reads the GGUF in place (mmap) and keeps an F32 KV cache (0.75 GiB at 2048 tokens); with less
+            # RAM than the file it still runs, re-reading experts from the disk (measured: 15 GB, 2 to 5 tokens/s on 4 cores)
+            "models": {"Q4_K_M": {"about": "4-bit, IFM's own quantization", "ram_gb": 24}},
+            "sha256": K2H_FILES, "contexts": (2048, 4096, 8192, 16384, 32768)},
+}
 
 # DeepSeek-V4.1-Flash (GGUF architecture deepseek41), Unsloth's UD-Q8_K_XL at the revision the port was checked against: a
 # family with an engine of its own (strata-dsv41, src/dsv41, ported from Project Maya's maya-ds4, MIT) that is not a
@@ -8569,6 +8589,92 @@ def own_path_parallel_note(a_parallel, fam: dict, model: str, vram_gb: float, ct
     return lines
 
 
+def install_k2h(a, family):
+    """K2 Horizon (PREVIEW_ONLY_FAMILIES): the model file (pinned size and SHA-256), the CPU engine strata-k2h compiled from
+    this checkout (build-k2h/), the tokenizer folder from the GGUF (tools/k2h/make_pack.py), the run config and the start
+    script.  No GPU and no llama.cpp: the engine is ggml-cpu's kernels over the GGUF read in place (docs/K2_HORIZON.md)."""
+    fam = PREVIEW_ONLY_FAMILIES[family]
+    say(f"Strata - {fam['title']} (in development: the CPU only)")
+    say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
+    if fam.get("license"):
+        say(f"  Its license: {fam['license']}")
+    model = a.model or next(iter(fam["models"]))
+    if model not in fam["models"]:
+        fail(f"{fam['title']} has no {model} model file", "choose one of: " + ", ".join(fam["models"]))
+    ram = ram_gb()
+    if ram < fam["models"][model]["ram_gb"]:
+        warn(f"{model} runs best with about {fam['models'][model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB: it runs, more "
+             "slowly (the experts are read from the disk again)")
+    ok(f"model: {fam['title']} {model}")
+    ctx = a.context or fam["contexts"][0]
+    if ctx not in fam["contexts"]:
+        warn(f"{ctx} tokens is not one of the sizes this engine was tried with ({', '.join(map(str, fam['contexts']))}): kept as you chose")
+    ok(f"context: {ctx} tokens (KV cache {2 * 48 * 1024 * 4 * ctx / 2**30:.2f} GiB of RAM)")
+    tag = fam["tag"] + model
+    data, _ = data_folder_for(a)
+    models_dir = Path(a.models_dir) if a.models_dir else data / "models"
+    folder = Path(a.gguf_dir) if a.gguf_dir else models_dir / tag
+    gguf = folder / fam["file"].format(q=model)
+    size, sha = fam["sha256"][gguf.name]
+    if not (gguf.exists() and (done(gguf) or a.gguf_dir)):
+        part = gguf.with_name(gguf.name + ".part")
+        left = (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+        if not a.gguf_dir:                             # (the person's own folder is never made here: step 3 says the file is missing)
+            folder.mkdir(parents=True, exist_ok=True)
+        if not a.gguf_dir and free_gb(folder) < left:
+            fail(f"not enough free disk space in {folder}: need ~{left:.0f} GB, {free_gb(folder):.0f} GB free",
+                 "use --models-dir on a bigger drive")
+
+    step(2, "the K2 Horizon engine (strata-k2h, compiled for this CPU)")
+    exe = ROOT / "build-k2h" / ("strata-k2h.exe" if WIN else "strata-k2h")
+    if a.skip_build and exe.exists():
+        ok(f"engine: {exe} (already compiled)")
+    else:
+        cmake_build(ROOT, ROOT / "build-k2h", "strata-k2h", ["-DSTRATA_BUILD_TESTS=OFF"], find_vcvars() if WIN else None,
+                    "build-k2h.bat" if WIN else "")
+        if not exe.exists():
+            fail(f"the build did not make {exe}", "see the compiler's messages above")
+        ok(f"engine: {exe}")
+
+    step(3, f"downloading {fam['title']} {model}")
+    if gguf.exists() and (done(gguf) or a.gguf_dir):
+        ok(f"{gguf.name} already downloaded")
+    else:
+        if a.gguf_dir:
+            fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
+        download(fam["hf"] + gguf.name, gguf)
+    verify_sha256(gguf, size, sha, own=bool(a.gguf_dir))
+    ok(f"model file: {gguf}")
+
+    step(4, "the tokenizer and the chat template")
+    pack = data / "packs" / tag.lower() / "tokenizer"
+    run([sys.executable, str(ROOT / "tools" / "k2h" / "make_pack.py"), str(gguf), str(pack)])
+    ok(f"tokenizer: {pack}")
+
+    step(5, "writing the start script")
+    port = a.port or 8080
+    threads = max(1, (os.cpu_count() or 4))
+    cfg = {"exe": str(exe), "args": ["--model", str(gguf), "--ctx", str(ctx), "--threads", str(threads)], "cwd": str(ROOT),
+           "tokenizer": str(pack), "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
+           "log": str(home() / f"strata-{tag.lower()}.log"), "port": port}
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    cfg_path = home() / f"strata-{tag.lower()}.json"
+    write_setup_config(cfg_path, cfg, None, explicit_args(a))
+    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    ok(f"start script: {script.name}")
+    say()
+    say("All set (in development: the CPU only, a few tokens a second).")
+    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1")
+    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
+    say(f"  Start it:         {script}")
+    return 0
+
+
 def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted):
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
@@ -10045,20 +10151,22 @@ def main() -> int:
         return mac_setup(sys.argv[1:])
     _peek = lambda flag: next((v.split("=", 1)[1] if v.startswith(flag + "=") else sys.argv[i + 2] if i + 2 < len(sys.argv) else None   # noqa: E731
                                for i, v in enumerate(sys.argv[1:]) if v == flag or v.startswith(flag + "=")), None)
-    if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES}) \
+    if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES, **PREVIEW_ONLY_FAMILIES}) \
             or (_peek("--model") and not _peek("--family") and model_alias(_peek("--model")) not in MODELS
-                and not any(model_alias(_peek("--model")) in f["models"] for f in (*OWN_PATH_FAMILIES.values(), *MULTI_FILE_FAMILIES.values()))):
+                and not any(model_alias(_peek("--model")) in f["models"] for f in (*OWN_PATH_FAMILIES.values(), *MULTI_FILE_FAMILIES.values(),
+                                                                                   *PREVIEW_ONLY_FAMILIES.values()))):
         feed_models_setup(_peek("--feed"))             # a name the built-in tables do not know may be a model of the signed feed
         if _peek("--family") in FEED_UNAVAILABLE:
             fail(f"{FEED_UNAVAILABLE[_peek('--family')]['title']} is {FEED_UNAVAILABLE[_peek('--family')]['reason']}")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(MULTI_FILE_FAMILIES),
+    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + list(MULTI_FILE_FAMILIES) + list(PREVIEW_ONLY_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
                          "several requests at once with --parallel; docs/QWEN36.md), deepseek41 = DeepSeek-V4.1-Flash "
                          "(the official 1.75 / 2.00 / 2.25 bpw versions, 239 / 257 / 274 GB; docs/DEEPSEEK41.md)")
     ap.add_argument("--model", type=model_alias, choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
                                                                        for m in f["models"]),
-                                                          *(m for f in MULTI_FILE_FAMILIES.values() for m in f["models"])])))
+                                                          *(m for f in MULTI_FILE_FAMILIES.values() for m in f["models"]),
+                                                          *(m for f in PREVIEW_ONLY_FAMILIES.values() for m in f["models"])])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -10201,7 +10309,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
-    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in MULTI_FILE_FAMILIES:
+    if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in MULTI_FILE_FAMILIES \
+            and a.family not in PREVIEW_ONLY_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **MULTI_FILE_FAMILIES}.items()
                                                               if a.model in d["models"]))
     if a.source:
@@ -10210,6 +10319,8 @@ def main() -> int:
         return prepare_pack_only(a)
     if a.inspect:                                      # headers only: nothing is installed
         sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+    if a.family in PREVIEW_ONLY_FAMILIES:              # K2 Horizon: the CPU engine, compiled here; no GPU step
+        return install_k2h(a, a.family)
     if sys.platform == "darwin" and CONTROL:           # the app on a Mac: model files only; the Metal engine is a component
         if a.family in MULTI_FILE_FAMILIES:            # DeepSeek-V4.1-Flash: its own engine package, the generic DeepSeek install
             return mac_dsv41_setup(a)
