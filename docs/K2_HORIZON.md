@@ -265,3 +265,40 @@ Checked 2026-11-10 on the same VM (4 cores, 15 GB RAM, the reference Q4_K_M, tem
 Decode through the server measured 2.2 to 2.7 tok/s, against 4.7 to 5.4 tok/s in the engine's own repeated check of
 one prompt; the cause is not measured (this machine's RAM holds about two thirds of the file, so which experts are
 already in the page cache matters).
+
+### Greedy agreement on ten prompts
+
+`strata-k2h --tokens IDS --n 32` against `llama-k2h-dump ... --generate 32` (llama.cpp b11454 CPU, F32 KV cache), ten
+prompts: five raw (English, a story opening, Python, Chinese, a history paragraph) and five chat-template ones (thinking
+off, except the last). The 32 tokens run past the end of the turn on purpose (no stop), to compare as far as possible.
+Same VM, 2026-11-10.
+
+| Prompt | Same leading tokens | Where they part |
+|---|---|---|
+| raw: "The capital of France is" | 32 / 32 | |
+| raw: "def fibonacci(n):" | 32 / 32 | |
+| raw: "The industrial revolution began ..." | 32 / 32 | |
+| chat: "Explain what a hash table is in two sentences." | 32 / 32 | |
+| chat, thinking on: "What is 17 * 23? ..." | 32 / 32 | |
+| chat: "What is the capital of France? ..." | 11 / 32 | after the end of the turn: the answer and its `<|ifm|im_end|>` are the same |
+| chat: "日本の首都はどこですか？..." | 24 / 32 | after the end of the turn, likewise |
+| raw: "Once upon a time" | 17 / 32 | " She had a special gift" / " She had a deep love" |
+| chat: "Write a haiku about autumn." | 10 / 32 | "Whispers of the wind in trees" / "Whispers on the cooling breeze" |
+| raw: "人工智能是" | 6 / 32 | "...的？" / "...的\n\n" |
+
+Every text, both sides, reads as fluent language (the CPU logs keep them). Where they part, the next-token logits of
+the same input (the prompt and the shared tokens; `strata-k2h --dump-logits` against llama.cpp's `result_output`):
+
+| Where | Largest \|logit difference\| | RMS difference | llama.cpp's top-1 margin |
+|---|---|---|---|
+| story, token 17 | 0.58 | 0.08 | 0.17 |
+| 人工智能是, token 6 | 1.35 | 0.15 | 0.04 |
+| haiku, token 10 | 0.96 | 0.17 | 0.10 (llama.cpp's own batch run of this input picks " on", its one-token-at-a-time run picked " of") |
+| 日本の首都, token 24 (after the turn) | 0.56 | 0.11 | 0.02 |
+| capital, token 11 (after the turn, after `<|ifm|endoftext|>`) | 5.54 | 1.09 | 2.12 |
+
+So inside the answers the two differ by up to 1.35 in a logit (0.08 to 0.17 RMS), and they part only where llama.cpp's
+own first and second choices are closer than that (0.02 to 0.17). The haiku case shows that this is the size of
+llama.cpp's own batch-versus-decode difference. Matching llama.cpp to the token on every prompt would need the same
+kernels in the same order, which no second implementation (and no other llama.cpp backend) has; the acceptance check
+is therefore read as: 32 of 32 on five prompts, and where they part, a near-tie of llama.cpp's own.

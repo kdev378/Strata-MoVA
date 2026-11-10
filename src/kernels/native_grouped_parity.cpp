@@ -412,6 +412,11 @@ int main(int argc, char** argv) {
     for (int gu : {29, 16, 17, 22, 42, 18, 23})
         for (int dt : {42, 20, 6, 8}) check(gu, dt, 2560, 640, s, rng);
     check(21, 23, 2560, 768, s, rng);
+    // K2 Horizon's Q4_K_M experts at its 2560 x 768: Q4_K gate/up with a Q4_K down (24 layers) or a Q6_K down (21 layers)
+    check(12, 12, 2560, 768, s, rng);
+#ifdef STRATA_Q6K_EXPERTS
+    check(12, 14, 2560, 768, s, rng);
+#endif
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

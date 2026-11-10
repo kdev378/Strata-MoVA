@@ -15,8 +15,9 @@
 //   * an F32 KV cache for --ctx positions; a request whose ids start with the previous request's reuses that prefix.
 //
 // Modes:
-//   strata-k2h --model M.gguf --tokens IDS [--n N] [--ctx C] [--threads T]
-//       the ids as a prompt, then N greedy tokens; prints the first step's top 5 and the generated ids with timings
+//   strata-k2h --model M.gguf --tokens IDS [--n N] [--ctx C] [--threads T] [--dump-logits FILE]
+//       the ids as a prompt, then N greedy tokens; prints the first step's top 5 and the generated ids with timings;
+//       --dump-logits writes the prompt's next-token logits (n_vocab F32)
 //   strata-k2h --model M.gguf --serve [--ctx C] [--threads T] [--eos IDS]
 //       serve/server.py's engine protocol: READY <ctx> stop; GEN <max_new> [key=value ...] <id,id,...> -> PP / T <id> / DONE;
 //       STOP ends a generation.  Sampling keys: temperature, top_k, top_p, min_p, seed (greedy without a temperature).
@@ -582,7 +583,7 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, tokens, eos_list = "1,250019";
+    std::string model, tokens, eos_list = "1,250019", dump_logits;
     bool serve = false;
     long long n_gen = 16, ctx = 2048;
     int threads = (int) std::max(1u, std::thread::hardware_concurrency());
@@ -601,6 +602,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::atoll(next().c_str());
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--eos") eos_list = next();
+        else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--serve") serve = true;
         else if (a == "--help" || a == "-h") {
             usage();
@@ -645,6 +647,14 @@ int main(int argc, char** argv) {
         const auto p0 = Clock::now();
         E.forward(ids, 0, lg);
         const double pms = ms_since(p0);
+        if (!dump_logits.empty()) {   // the prompt's next-token logits, n_vocab F32 (to compare with llama.cpp's result_output)
+            std::FILE* f = std::fopen(dump_logits.c_str(), "wb");
+            if (!f || std::fwrite(lg.data(), sizeof(float), lg.size(), f) != lg.size()) {
+                std::fprintf(stderr, "strata-k2h: cannot write %s\n", dump_logits.c_str());
+                return 1;
+            }
+            std::fclose(f);
+        }
         const std::vector<int32_t> top = R::argsort_desc(lg.data(), (int64_t) lg.size());
         std::printf("prompt: %zu tokens in %.0f ms; top 5:", ids.size(), pms);
         for (int i = 0; i < 5; ++i) std::printf(" %d (%.4f)", top[(size_t) i], lg[(size_t) top[(size_t) i]]);
