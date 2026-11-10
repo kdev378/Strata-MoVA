@@ -302,3 +302,17 @@ own first and second choices are closer than that (0.02 to 0.17). The haiku case
 llama.cpp's own batch-versus-decode difference. Matching llama.cpp to the token on every prompt would need the same
 kernels in the same order, which no second implementation (and no other llama.cpp backend) has; the acceptance check
 is therefore read as: 32 of 32 on five prompts, and where they part, a near-tie of llama.cpp's own.
+
+## The GPU's grouped expert kernels: Q4_K down
+
+`native_expert_grouped` (`src/kernels/cuda/iq_kernels.cu`) takes Q4_K for gate/up but had no Q4_K down: none of the
+other models has one. K2 Horizon's Q4_K_M has a Q4_K `ffn_down_exps` in 24 of its 45 MoE layers (Q6_K in the other 21,
+which the kernels take). Type 12 is now in `STRATA_D_FMTS` (both variants, with and without `STRATA_Q6K_EXPERTS`), with
+the same `Fmt<12>` row dot the gate/up already use (ggml's `vec_dot_q4_K_q8_1`); n_ff 768 is three whole 256-blocks.
+`native_grouped_parity` checks K2's pairs at its 2560 x 768 (Q4_K / Q4_K and Q4_K / Q6_K).
+
+Checked here (no GPU): `iq_kernels.cu` compiles with nvcc 13.5 for compute_86 (the RTX 3070's), with and without
+`STRATA_Q6K_EXPERTS`, and the kernels it makes differ from the file before by exactly three:
+`native_down_kernel<12>` and `native_down_multi_kernel<12, false|true, false>` (436 -> 439 kernels; every other kernel's
+name the same). Not checked: a full CUDA / HIP build, and `native_grouped_parity` on a GPU, which compares the kernel's
+results with the CPU's; run it on the card before the GPU path uses these kernels.
