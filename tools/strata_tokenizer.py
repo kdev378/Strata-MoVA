@@ -130,7 +130,8 @@ def pre_tokenizer_kind(pre) -> str | None:
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None,
+                 output_text: dict[int, str] | None = None):
         self.tokens = tokens
         self.pre = pre
         if pre_tokenizer_kind(pre) is None:
@@ -192,6 +193,11 @@ class Tokenizer:
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}
         self._bytes_cache: dict[int, bytes] = {}
+        # A pack's "output_text" (K2 Horizon's): ids whose DECODED text is another spelling, so that the server's reasoning
+        # parser sees `</think>` where the model writes its own `</ifm|think>`.  Encoding is unchanged: the prompt still
+        # carries the model's own tokens.  Empty for every other pack.
+        for i, text in (output_text or {}).items():
+            self._bytes_cache[int(i)] = text.encode("utf-8")
         # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
         self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
 

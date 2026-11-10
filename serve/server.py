@@ -4541,6 +4541,11 @@ def end_token_ids(tokenizer) -> set[int]:
         eos = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
         if eos is not None:
             ids.add(int(eos))
+    # a pack's own end-of-turn token (K2 Horizon's <|ifm|im_end|>: the eos above is its end of text, which a chat turn
+    # does not write); only packs that name one
+    eot = (getattr(tokenizer, "special_ids", None) or {}).get("eot")
+    if eot is not None:
+        ids.add(int(eot))
     return ids
 
 
@@ -10058,7 +10063,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         except (OSError, ValueError):
             pass
         try:
-            tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+            tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None,
+                               tcfg.get("output_text") or None)
         except ST.UnknownPreTokenizer as e:             # a model with its own splitting rule: stop here, never split with another's
             ap.error(f"the model's tokenizer ({tpath}): {e}")
     if a.engine == "strata" and not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
@@ -10188,7 +10194,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if swapped:
             print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
                   "using the V4.1 template so tool calls come back as real calls", flush=True)
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    # a pack that says add_bos (K2 Horizon's): its template opens with bos_token, so the prompt starts with that token as in
+    # transformers and llama.cpp; the other packs name no bos_token and render as before
+    tpl_defaults = {}
+    if tcfg.get("add_bos") and isinstance(tcfg.get("special_ids"), dict) and "bos" in tcfg["special_ids"]:
+        tpl_defaults["bos_token"] = tok.tokens[int(tcfg["special_ids"]["bos"])]
+    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja", tpl_defaults),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))

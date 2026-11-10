@@ -5,7 +5,9 @@
 Writes OUT_DIR/vocab.json, merges.txt, token_type.json, tokenizer.json ({"pre": "k2-horizon", "special_ids": ...}) and
 chat_template.jinja (the GGUF's tokenizer.chat_template), the same files tools/dsv41/pack_gguf.py writes for DeepSeek.
 special_ids: bos and eos from the GGUF (0 <|ifm|begin_of_text|>, 1 <|ifm|endoftext|>) and "eot", the token that ends an
-assistant turn in the chat template (<|ifm|im_end|>; llama.cpp counts it as an end of generation too).
+assistant turn in the chat template (<|ifm|im_end|>; llama.cpp counts it as an end of generation too).  add_bos: the
+template opens with bos_token (the server passes it).  output_text: K2's thinking tags (<ifm|think>, </ifm|think> and
+the _fast / _faster ones) decoded as <think> / </think>, the spelling the server's reasoning parser reads.
 """
 from __future__ import annotations
 
@@ -39,8 +41,15 @@ def write_pack(model: pathlib.Path, out: pathlib.Path) -> dict:
     (out / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(tokens)}, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join(merges), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(types))
+    # the thinking tags as serve/server.py's reasoning parser spells them (output only: the prompt keeps K2's tokens)
+    output_text = {}
+    for tag, text in (("<ifm|think>", "<think>"), ("</ifm|think>", "</think>"), ("<ifm|think_fast>", "<think>"),
+                      ("</ifm|think_fast>", "</think>"), ("<ifm|think_faster>", "<think>"), ("</ifm|think_faster>", "</think>")):
+        if tag in tokens:
+            output_text[str(tokens.index(tag))] = text
     (out / "tokenizer.json").write_text(json.dumps({"pre": "k2-horizon", "special_ids": special,
-                                                     "add_bos": bool(md.get("tokenizer.ggml.add_bos_token", True))}, indent=1))
+                                                     "add_bos": bool(md.get("tokenizer.ggml.add_bos_token", True)),
+                                                     "output_text": output_text}, indent=1))
     template = md.get("tokenizer.chat_template")
     if template:
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")

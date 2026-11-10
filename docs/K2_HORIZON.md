@@ -207,3 +207,45 @@ Measured 2026-11-10 on the reference file, 4-core cloud VM with 15 GB of RAM (th
 | First step's top 5 | the same 5 as llama.cpp (ranks 3 and 4 swapped, as in the CPU reference) |
 | Decode, cold page cache (first run) | 1.71 tokens/s |
 | Decode, warm page cache (serve, later requests) | 4.7 to 5.4 tokens/s |
+
+## Serving it (localhost API)
+
+K2 Horizon is not offered by setup or `strata launch` yet. From a source build:
+
+1. Build `strata-k2h` (CMake target, CPU build; it needs `STRATA_NATIVE_EXPERTS`, on by default).
+2. Make the tokenizer folder from the GGUF: `python tools/k2h/make_pack.py K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf k2pack`.
+3. A config, for example `k2.json`:
+
+   ```json
+   {"exe": "build/strata-k2h",
+    "args": ["--model", "K2-Horizon-MoVA-36B-A4B-Q4_K_M.gguf", "--ctx", "2048", "--threads", "8"],
+    "tokenizer": "k2pack",
+    "arch": "k2-horizon",
+    "model_name": "k2-horizon-mova-36b-a4b"}
+   ```
+
+4. `python -m serve.server --engine strata --config k2.json --port 8080`.
+
+What the server does differently for this pack, each switched on by a key only K2's `tokenizer.json` has (other packs
+render, tokenize and stop exactly as before):
+
+- `add_bos`: the template gets `bos_token` (`<|ifm|begin_of_text|>`); K2's template starts with it.
+- `special_ids.eot`: `<|ifm|im_end|>` ends a reply (the eos, `<|ifm|endoftext|>`, is not written at the end of a turn).
+- `output_text`: K2's thinking tags (`<ifm|think>`, `</ifm|think>` and the `_fast` / `_faster` ones) decode as `<think>` /
+  `</think>`, so the server's reasoning parser splits the reasoning from the answer. Prompts keep K2's own tokens.
+- The chat template's `{% generation %}` tag (transformers' AssistantTracker) is understood by every template now: its
+  body is rendered as it is.
+
+Checked 2026-11-10 on the same VM (4 cores, 15 GB RAM, the reference Q4_K_M, temperature 0):
+
+| Request | Reply | Finish | Decode |
+|---|---|---|---|
+| OpenAI, "What is the capital of France? Answer in one sentence.", thinking off | "The capital of France is Paris." | stop | 2.7 tok/s |
+| OpenAI, "What is 17 * 23? Reply with the number only.", thinking on (the template's default) | reasoning: computes and checks 17 x 23 = 391; content: "391" | stop | 2.2 tok/s |
+| OpenAI, streamed, "Write a short paragraph about why the sky is blue.", thinking off | a five-sentence paragraph on Rayleigh scattering, no repetition | stop | 2.3 tok/s |
+| OpenAI, "日本の首都はどこですか？一文で答えてください。", thinking off | "日本の首都は東京です。" | stop | 2.3 tok/s |
+| Anthropic `/v1/messages`, "Name three primary colors.", thinking disabled | "Red, blue, and yellow." | end_turn | 2.3 tok/s |
+
+Decode through the server measured 2.2 to 2.7 tok/s, against 4.7 to 5.4 tok/s in the engine's own repeated check of
+one prompt; the cause is not measured (this machine's RAM holds about two thirds of the file, so which experts are
+already in the page cache matters).
