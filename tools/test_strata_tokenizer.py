@@ -405,6 +405,17 @@ class PreTokenizerType(unittest.TestCase):
         self.assertEqual(ST.pre_tokenizer_kind(""), "qwen35")
         for p in ("deepseek3", "deepseek-v3", "deepseek-llm", "deepseek41"):
             self.assertEqual(ST.pre_tokenizer_kind(p), "deepseek3", p)
+        self.assertEqual(ST.pre_tokenizer_kind("k2-horizon"), "k2-horizon")
+
+    def test_k2_horizon_split(self):
+        """K2 Horizon's rule (llama.cpp LLAMA_VOCAB_PRE_TYPE_K2_HORIZON): digits in runs of up to 3, letters / marks / ZWJ /
+        ZWNJ as one word, contractions apart.  (Against llama.cpp on the real vocabulary: 1,343 strings, docs/K2_HORIZON.md.)"""
+        tok = ST.Tokenizer([chr(i) for i in range(4)], [], None, "k2-horizon")
+        self.assertEqual(tok._split("Hello world's 12345 a‍b  \n\nx!!"),
+                         ["Hello", " world", "'s", " ", "123", "45", " a‍b", "  \n\n", "x", "!!"])
+        self.assertEqual(tok._split("été ,; 7"), ["été", " ,;", " ", "7"])
+        qwen = ST.Tokenizer([chr(i) for i in range(4)], [], None, "qwen35")
+        self.assertEqual(qwen._split("12345"), ["1", "2", "3", "4", "5"])   # qwen35 splits every digit: the rules differ
 
     def test_unknown_types_are_refused_with_the_name(self):
         for p in ("qwen2", "qwen3", "qwen4", "default", "gpt2", "llama-bpe", "joyai-llm", "Qwen35", " qwen35"):

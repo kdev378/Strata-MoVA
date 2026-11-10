@@ -12,6 +12,9 @@
 //       greedy: N tokens after the prompt (argmax, the lowest id on equal logits), to OUT_DIR/generated.txt and stdout;
 //       no tensors are written.  --default-cache keeps llama.cpp's own context defaults (F16 KV cache, flash attention
 //       auto) instead of the F32 cache with flash attention off.
+//   llama-k2h-dump MODEL.gguf OUT_DIR --tokenize CORPUS.jsonl
+//       llama.cpp's tokenizer only (the vocabulary is loaded, not the weights): each line of CORPUS.jsonl is a JSON string;
+//       OUT_DIR/tokenized.txt gets one line per string, "<ids without special parsing>|<ids with special parsing>", no BOS.
 //
 // Writes OUT_DIR/tokens.txt (the token ids), OUT_DIR/index.txt (one line per tensor: name type ne0 ne1 ne2 ne3) and
 // OUT_DIR/<name>.f32 (the tensor as F32, ne0 fastest, contiguous).  The tensors are the graph's names (src/models/
@@ -106,7 +109,7 @@ std::vector<llama_token> parse_ids(const char* s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
+    if (argc < 4 && !(argc == 5 && std::string(argv[3]) == "--tokenize")) {
         std::fprintf(stderr, "usage: %s MODEL.gguf OUT_DIR (--prompt TEXT | --tokens IDS) [--layers N] [--threads N] [--ctx N] [--logits]\n",
                      argv[0]);
         return 2;
@@ -116,6 +119,7 @@ int main(int argc, char** argv) {
     std::string prompt;
     std::vector<llama_token> tokens;
     int threads = 4, n_ctx = 2048, generate = 0;
+    std::string corpus;
     bool default_cache = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -127,16 +131,60 @@ int main(int argc, char** argv) {
         else if (a == "--logits") d.logits = true;
         else if (a == "--generate" && i + 1 < argc) generate = std::atoi(argv[++i]);
         else if (a == "--default-cache") default_cache = true;
+        else if (a == "--tokenize" && i + 1 < argc) corpus = argv[++i];
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
+    for (int i = 3; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--tokenize") mp.vocab_only = true;
     mp.use_extra_bufts = false;   // no CPU repack: the weights stay in the mmap (a 22 GB file on a 15 GB machine) and
                                   // the matmuls read the file's own blocks
     llama_model* model = llama_model_load_from_file(argv[1], mp);
     if (!model) { std::fprintf(stderr, "cannot load %s\n", argv[1]); return 1; }
     const llama_vocab* vocab = llama_model_get_vocab(model);
+    if (!corpus.empty()) {
+        // one JSON string per line: unescape it (\\, \", \n, \t, \r, \uXXXX with surrogate pairs) to UTF-8
+        std::ifstream in(corpus);
+        std::ofstream out(d.dir + "/tokenized.txt", std::ios::trunc);
+        std::string line;
+        size_t n_lines = 0;
+        while (std::getline(in, line)) {
+            std::string text;
+            for (size_t i = 1; i + 1 < line.size(); ++i) {
+                char c = line[i];
+                if (c != '\\') { text += c; continue; }
+                c = line[++i];
+                if (c == 'n') text += '\n'; else if (c == 't') text += '\t'; else if (c == 'r') text += '\r';
+                else if (c == 'b') text += '\b'; else if (c == 'f') text += '\f';
+                else if (c == 'u') {
+                    unsigned cp = (unsigned) std::stoul(line.substr(i + 1, 4), nullptr, 16);
+                    i += 4;
+                    if (cp >= 0xD800 && cp < 0xDC00 && i + 6 < line.size() && line[i + 1] == '\\' && line[i + 2] == 'u') {
+                        const unsigned lo = (unsigned) std::stoul(line.substr(i + 3, 4), nullptr, 16);
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+                    if (cp < 0x80) text += (char) cp;
+                    else if (cp < 0x800) { text += (char) (0xC0 | (cp >> 6)); text += (char) (0x80 | (cp & 0x3F)); }
+                    else if (cp < 0x10000) { text += (char) (0xE0 | (cp >> 12)); text += (char) (0x80 | ((cp >> 6) & 0x3F)); text += (char) (0x80 | (cp & 0x3F)); }
+                    else { text += (char) (0xF0 | (cp >> 18)); text += (char) (0x80 | ((cp >> 12) & 0x3F)); text += (char) (0x80 | ((cp >> 6) & 0x3F)); text += (char) (0x80 | (cp & 0x3F)); }
+                } else text += c;
+            }
+            for (int special = 0; special < 2; ++special) {
+                std::vector<llama_token> buf(text.size() * 2 + 16);
+                const int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), buf.data(), (int32_t) buf.size(), false, special == 1);
+                for (int k = 0; k < n; ++k) out << (k ? "," : "") << buf[(size_t) k];
+                out << (special == 0 ? "|" : "\n");
+            }
+            ++n_lines;
+        }
+        std::fprintf(stderr, "llama-k2h-dump: %zu strings tokenized to %s/tokenized.txt\n", n_lines, d.dir.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
     if (tokens.empty()) {
         std::vector<llama_token> buf(prompt.size() + 16);
         const int n = llama_tokenize(vocab, prompt.c_str(), (int32_t) prompt.size(), buf.data(), (int32_t) buf.size(), true, true);

@@ -78,6 +78,20 @@ DEEPSEEK3_PATTERNS = (
 )
 
 
+# The `k2-horizon` pre-tokenizer (IFM's K2 Horizon; llama.cpp b11454 src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_K2_HORIZON), one
+# pattern.  Unlike qwen35 it keeps digits in runs of 1..3 (\p{N}{1,3}) and lets letters, marks and the zero-width
+# (non-)joiners U+200C / U+200D run together into one word; the punctuation run excludes only letters and digits.
+K2_HORIZON_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -102,11 +116,13 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "deepseek3", or
-    None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "deepseek3",
+    "k2-horizon", or None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
         return "qwen35"
+    if p == "k2-horizon":
+        return "k2-horizon"
     if p.startswith("deepseek"):
         return "deepseek3"
     return None
@@ -142,6 +158,9 @@ class Tokenizer:
         if pre_tokenizer_kind(pre) == "deepseek3":
             seq = [regex.compile(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif pre_tokenizer_kind(pre) == "k2-horizon":
+            self._re = regex.compile(K2_HORIZON_PATTERN)
+            self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
             self._split = self._re.findall
